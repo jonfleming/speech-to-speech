@@ -41,7 +41,10 @@ dependencies = [
     "torch==2.11.0; platform_system == 'Darwin'",
     "torch>=2.4.0; platform_system != 'Darwin'",
     "torchaudio==2.11.0; platform_system == 'Darwin'",
-    "torchaudio>=2.4.0; platform_system != 'Darwin'",
+    "torchaudio>=2.11.0; platform_system != 'Darwin'",
+
+    "torchvision==0.26.0; platform_system != 'Darwin'", 
+
     "transformers==5.6.2; platform_system == 'Darwin'",
     "transformers>=4.57.0; platform_system != 'Darwin'",
     "uvicorn>=0.30.0",
@@ -119,6 +122,16 @@ asyncio_mode = "auto"
 [tool.uv]
 package = true
 prerelease = "allow"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.setuptools.packages.find]
 where = ["src"]

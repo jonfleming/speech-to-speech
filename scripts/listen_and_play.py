@@ -58,16 +58,28 @@ def listen_and_play(
         -1, 2, size=list_play_chunk_size, dtype=np.int16
     ).tobytes()
 
+    # Track playback state for muting mic during playback
+    playback_active = threading.Event()
+    playback_active.clear()  # Start with mic unmuted
+
     def callback_recv(outdata, frames, time, status):
         if not recv_queue.empty():
             data = recv_queue.get()
             outdata[: len(data)] = data
             outdata[len(data) :] = b"\x00" * (len(outdata) - len(data))
+            # Audio is playing, mute the mic
+            playback_active.set()
         else:
             outdata[:] = dither_bytes
+            # No audio playing, unmute the mic after a brief delay
+            if playback_active.is_set():
+                playback_active.clear()
 
     def callback_send(indata, frames, time, status):
-        if recv_queue.empty():
+        # Mute mic during playback to prevent feedback
+        if playback_active.is_set():
+            indata.fill(0)  # Zero out input data to mute the microphone
+        elif recv_queue.empty():
             data = bytes(indata)
             send_queue.put(data)
 

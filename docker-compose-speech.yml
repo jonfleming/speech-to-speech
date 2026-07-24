@@ -1,0 +1,47 @@
+---
+services:
+
+  # The 'llama' service definition has been removed as it is now pointing 
+  # to an external endpoint and should not be run by Docker Compose.
+
+  pipeline:
+    depends_on: [] # Removed dependency on the local 'llama' service
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile}
+    command:
+      - speech-to-speech
+      - --mode
+      - socket
+      - --recv_host
+      - 0.0.0.0
+      - --send_host
+      - 0.0.0.0
+      - --llm_backend
+      - responses-api
+      - --model_name
+      - ggml-org/gemma-4-E4B-it-GGUF
+      # *** MODIFIED LINE: Points to the external server instead of 'http://llama:8080/v1' ***
+      - --responses_api_base_url 
+      - http://100.111.132.40:8080/v1 # Use '/v1' assuming the external service mirrors this API versioning
+      - --responses_api_api_key
+      - ""
+      - --init_chat_role
+      - system
+      - --init_chat_prompt
+      - "You are a helpful assistant"
+    expose:
+      - 12345/tcp
+      - 12346/tcp
+    ports:
+      - 12345:12345/tcp
+      - 12346:12346/tcp
+    volumes:
+      - ./cache/:/root/.cache/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
