@@ -74,10 +74,10 @@ class ListenAndPlayRealtimeArguments:
         default=False,
         metadata={"help": "Print raw event payloads in addition to friendly logs."},
     )
-    block_mic_during_playback: bool = field(
-        default=False,
+    playback_mute_hold_ms: int = field(
+        default=250,
         metadata={
-            "help": "If set, pause microphone capture while speaker audio is playing. Disabled by default so barge-in works."
+            "help": "Keep mic muted for this many milliseconds after playback chunks to reduce feedback."
         },
     )
 
@@ -142,7 +142,9 @@ async def listen_and_play_realtime(args: ListenAndPlayRealtimeArguments) -> None
     stop_event = Event()
     playback_buffer = bytearray()
     playback_lock = Lock()
-    speaker_active_until = [0.0]
+    mute_hold_seconds = max(0, args.playback_mute_hold_ms) / 1000.0
+    mute_deadline = [0.0]
+    playback_active = [False]
     partial_user_text = ""
     live_user_width = 0
     saw_user_speech = False
@@ -170,32 +172,39 @@ async def listen_and_play_realtime(args: ListenAndPlayRealtimeArguments) -> None
         live_user_width = 0
 
     def clear_playback_buffer() -> None:
-        speaker_active_until[0] = 0.0
         with playback_lock:
             playback_buffer.clear()
+            mute_deadline[0] = 0.0
+            playback_active[0] = False
+
+    def should_mute_mic(now: float) -> bool:
+        with playback_lock:
+            return playback_active[0] or now < mute_deadline[0]
 
     def callback_recv(outdata, _frames, _time_info, status):
         if status:
             print(f"Speaker status: {status}", flush=True)
 
         needed = len(outdata)
+        now = time.monotonic()
         with playback_lock:
             available = min(needed, len(playback_buffer))
             if available:
                 outdata[:available] = playback_buffer[:available]
                 del playback_buffer[:available]
+                mute_deadline[0] = now + mute_hold_seconds
+                playback_active[0] = True
             if available < needed:
                 outdata[available:] = b"\x00" * (needed - available)
+            if available == 0 and playback_active[0] and now >= mute_deadline[0]:
+                playback_active[0] = False
 
     def callback_send(indata, _frames, _time_info, status):
         if status:
             print(f"Mic status: {status}", flush=True)
 
-        if args.block_mic_during_playback:
-            with playback_lock:
-                speaker_active = bool(playback_buffer)
-            if speaker_active or time.monotonic() < speaker_active_until[0]:
-                return
+        if should_mute_mic(time.monotonic()):
+            return
 
         try:
             mic_queue.put_nowait(bytes(indata))
@@ -255,7 +264,6 @@ async def listen_and_play_realtime(args: ListenAndPlayRealtimeArguments) -> None
                 audio = base64.b64decode(event.delta)
                 with playback_lock:
                     playback_buffer.extend(audio)
-                speaker_active_until[0] = time.monotonic() + max(0.15, len(audio) / (2 * args.recv_rate))
             elif event.type == "response.output_audio.done":
                 print("ASSISTANT: <audio done>", flush=True)
             elif event.type == "response.output_audio_transcript.done":
@@ -353,9 +361,9 @@ def main() -> None:
     )
     parser.add_argument("--print-json", action="store_true", default=defaults.print_json)
     parser.add_argument(
-        "--block-mic-during-playback",
-        action="store_true",
-        default=defaults.block_mic_during_playback,
+        "--playback-mute-hold-ms",
+        type=int,
+        default=defaults.playback_mute_hold_ms,
     )
     namespace = parser.parse_args()
     args = ListenAndPlayRealtimeArguments(
@@ -373,7 +381,7 @@ def main() -> None:
         instructions=namespace.instructions,
         voice=namespace.voice,
         print_json=namespace.print_json,
-        block_mic_during_playback=namespace.block_mic_during_playback,
+        playback_mute_hold_ms=namespace.playback_mute_hold_ms,
     )
     try:
         asyncio.run(listen_and_play_realtime(args))
