@@ -83,8 +83,8 @@ class ListenAndPlayRealtimeArguments:
 
 
 def _make_client(args: ListenAndPlayRealtimeArguments) -> AsyncOpenAI:
-    base_url = args.base_url or f"http://{args.host}:{args.port}/v1"
-    websocket_base_url = args.websocket_base_url or f"ws://{args.host}:{args.port}/v1"
+    base_url = args.base_url if args.base_url is not None else f"http://{args.host}:{args.port}/v1"
+    websocket_base_url = args.websocket_base_url if args.websocket_base_url is not None else f"ws://{args.host}:{args.port}/v1"
     return AsyncOpenAI(
         api_key=args.api_key,
         base_url=base_url,
@@ -230,6 +230,11 @@ async def listen_and_play_realtime(args: ListenAndPlayRealtimeArguments) -> None
 
         while not stop_event.is_set():
             event = await conn.recv()
+            if event is None:
+                # The `openai` client's stream yields None when the connection
+                # is closed without a specific code (e.g. clean server shutdown).
+                print("Connection closed by server.", flush=True)
+                break
 
             if args.print_json:
                 try:
@@ -342,7 +347,7 @@ async def listen_and_play_realtime(args: ListenAndPlayRealtimeArguments) -> None
 def main() -> None:
     parser = argparse.ArgumentParser(description="Talk to the local OpenAI-compatible realtime speech pipeline.")
     defaults = ListenAndPlayRealtimeArguments()
-    parser.add_argument("--host", default=defaults.host)
+    parser.add_argument("--host", default="127.0.0.1", help="Realtime server host. Default is 127.0.0.1.")
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--model", default=defaults.model)
     parser.add_argument("--api-key", default=defaults.api_key)

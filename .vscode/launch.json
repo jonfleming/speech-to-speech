@@ -5,6 +5,24 @@
     "version": "0.2.0",
     "configurations": [
         {
+        "name": "Debug uv app",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "speech_to_speech.s2s_pipeline",
+        "args": [
+            "--responses_api_base_url",
+            "http://omen.home.arpa:8080",
+            "--responses_api_api_key", "ollama-key",
+            "--ws_host", "0.0.0.0",
+            "--mode", "realtime",
+            "--ws_port", "8765",
+            "--tts", "qwen3",
+            "--qwen3_tts_backend", "torch"
+        ],
+        "cwd": "${workspaceFolder}",
+        "console": "integratedTerminal"
+        },        
+        {
             "name": "Python Debugger: Current File",
             "type": "debugpy",
             "request": "launch",
