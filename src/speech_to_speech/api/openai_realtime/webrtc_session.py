@@ -14,9 +14,11 @@ output queues, and this module only turns delivered PCM into paced RTP frames.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Awaitable
 from fractions import Fraction
@@ -40,11 +42,80 @@ AUDIO_PTIME = 0.02  # 20 ms frames
 WEBRTC_FRAME_SAMPLES = int(WEBRTC_SAMPLE_RATE * AUDIO_PTIME)
 DATA_CHANNEL_LABEL = "oai-events"
 ICE_SERVERS_ENV = "SPEECH_TO_SPEECH_ICE_SERVERS"
+ICE_ADDRESSES_ENV = "SPEECH_TO_SPEECH_ICE_ADDRESSES"
 ICE_GATHERING_TIMEOUT_S = 5.0
 # How long a negotiated session may sit without the peer connection reaching
 # "connected" before we release its pipeline unit. Without this, a client that
 # receives the SDP answer and never completes ICE would hold the unit forever.
 CONNECT_TIMEOUT_S = 30.0
+
+
+#: Allowed networks for ICE host candidates, parsed from SPEECH_TO_SPEECH_ICE_ADDRESSES.
+_address_filter_networks: Optional[list[ipaddress.IPv4Network | ipaddress.IPv6Network]] = None
+_address_filter_installed = False
+
+
+def _address_allowed(address: str, networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(ip in network for network in networks)
+
+
+def install_ice_address_filter() -> None:
+    """Restrict aioice's ICE host candidates to SPEECH_TO_SPEECH_ICE_ADDRESSES.
+
+    aioice gathers a host candidate on every network interface — Tailscale,
+    WSL/Hyper-V vNICs, APIPA link-local, ... — and probes each one, stalling
+    ICE for roughly 20 s per unreachable pair (and logging noisy bind failures
+    on addresses that cannot be bound at all). The env var holds a
+    comma/space-separated list of IPs or CIDRs, e.g. ``192.168.0.112`` or
+    ``192.168.0.0/24``; host candidates outside it are never gathered, so the
+    answer SDP only advertises usable addresses.
+
+    aioice exposes no configuration knob for this, so we wrap its
+    ``get_host_addresses`` enumeration. The patch is installed once and is a
+    no-op when the env var is unset. If aioice isn't installed or ever drops
+    that hook, we log a warning and keep the default all-interface behavior
+    rather than crash.
+    """
+    global _address_filter_installed, _address_filter_networks
+
+    raw = os.environ.get(ICE_ADDRESSES_ENV)
+    if not raw:
+        return
+
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for token in raw.replace(",", " ").split():
+        try:
+            networks.append(ipaddress.ip_network(token, strict=False))
+        except ValueError:
+            logger.error(f"Ignoring invalid {ICE_ADDRESSES_ENV} entry {token!r} — keeping all interfaces")
+            return
+    if not networks:
+        return
+
+    if not _address_filter_installed:
+        try:
+            from aioice import ice as aioice_ice
+        except (ImportError, AttributeError):
+            logger.warning("Cannot restrict ICE host candidates: aioice is not installed")
+            return
+        original = aioice_ice.get_host_addresses
+
+        def _filtered(use_ipv4: bool, use_ipv6: bool) -> list[str]:
+            candidates = original(use_ipv4, use_ipv6)
+            networks = _address_filter_networks
+            if not networks:
+                return candidates
+            return [a for a in candidates if _address_allowed(a, networks)]
+
+        aioice_ice.get_host_addresses = _filtered
+        _address_filter_installed = True
+
+    _address_filter_networks = networks
+    logger.info(f"Restricting ICE host candidates to {', '.join(str(n) for n in networks)}")
 
 
 def rtc_configuration_from_env() -> Optional[RTCConfiguration]:
@@ -54,7 +125,11 @@ def rtc_configuration_from_env() -> Optional[RTCConfiguration]:
     ``[{"urls": "stun:stun.example.com:3478"},
        {"urls": "turn:turn.example.com", "username": "u", "credential": "c"}]``.
     Returns None (aiortc defaults) when unset or invalid.
+
+    Also applies SPEECH_TO_SPEECH_ICE_ADDRESSES via :func:`install_ice_address_filter`,
+    which restricts the gathered ICE host candidates (see that function).
     """
+    install_ice_address_filter()
     raw = os.environ.get(ICE_SERVERS_ENV)
     if not raw:
         return None
@@ -65,6 +140,25 @@ def rtc_configuration_from_env() -> Optional[RTCConfiguration]:
         logger.error(f"Ignoring invalid {ICE_SERVERS_ENV}: {e}")
         return None
     return RTCConfiguration(iceServers=servers)
+
+
+# aiortc >= 1.12 advertises a fingerprint for every supported digest algorithm
+# (sha-256, sha-384, sha-512) on each m-section — see RTCCertificate
+# .getFingerprints() and the per-media fingerprint loop in aiortc's sdp.py.
+# RFC 8122 permits several and browsers tolerate them, but many embedded
+# WebRTC stacks (e.g. ESP32) require exactly one `a=fingerprint:sha-256` per
+# m-section and reject the answer, aborting the DTLS handshake. The fingerprint
+# is only an advertisement of the (unchanged) DTLS certificate, so pruning the
+# non-sha-256 lines is safe: the peer hashes the cert with sha-256 and matches
+# the remaining line.
+# The `(?:\r?\n|$)` alternative consumes the whole line: with MULTILINE `$`
+# alone would leave the trailing `\n` behind, littering the SDP with blank lines.
+_NON_SHA256_FINGERPRINT = re.compile(r"^a=fingerprint:(?!sha-256\b)\S+\s+\S+\s*(?:\r?\n|$)", re.MULTILINE)
+
+
+def _strip_non_sha256_fingerprints(sdp: str) -> str:
+    """Return *sdp* with every DTLS fingerprint line but the sha-256 one removed."""
+    return _NON_SHA256_FINGERPRINT.sub("", sdp)
 
 
 class PcmResampler:
@@ -266,7 +360,11 @@ class WebRTCSession(SessionTransport):
                 logger.warning("[WebRTC] ICE gathering timed out, returning partial SDP")
 
         self._spawn(self._connect_watchdog())
-        return self._pc.localDescription.sdp
+        sdp = self._pc.localDescription.sdp
+        answer_sdp = _strip_non_sha256_fingerprints(sdp)
+        if answer_sdp != sdp:
+            logger.info("[WebRTC] Stripped non-sha-256 DTLS fingerprint lines from answer")
+        return answer_sdp
 
     async def close(self) -> None:
         if self._closed:

@@ -41,6 +41,7 @@ from speech_to_speech.api.openai_realtime.webrtc_session import (  # noqa: E402
     WEBRTC_SAMPLE_RATE,
     PcmResampler,
     PipelineAudioTrack,
+    _strip_non_sha256_fingerprints,
 )
 from speech_to_speech.pipeline.cancel_scope import CancelScope  # noqa: E402
 from speech_to_speech.pipeline.events import SpeechStartedEvent  # noqa: E402
@@ -164,6 +165,148 @@ class TestPcmResampler:
         samples = np.frombuffer(bytes(total), dtype=np.int16)
         # 5120 samples at 16 kHz → ~15360 at 48 kHz, minus filter delay.
         assert 15000 <= samples.shape[0] <= 15360
+
+
+# ---------------------------------------------------------------------------
+# Answer SDP sanitization (single sha-256 fingerprint for embedded clients)
+# ---------------------------------------------------------------------------
+
+
+class TestFingerprintSanitization:
+    def test_strips_non_sha256_fingerprints_from_every_msection(self):
+        sdp = (
+            "v=0\r\n"
+            "o=- 1 1 IN IP4 0.0.0.0\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            "a=mid:audio\r\n"
+            "a=fingerprint:sha-256 AA:BB\r\n"
+            "a=fingerprint:sha-384 CC:DD\r\n"
+            "a=fingerprint:sha-512 EE:FF\r\n"
+            "a=setup:active\r\n"
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            "a=mid:datachannel\r\n"
+            "a=fingerprint:sha-256 AA:BB\r\n"
+            "a=fingerprint:sha-384 CC:DD\r\n"
+            "a=fingerprint:sha-512 EE:FF\r\n"
+            "a=setup:active\r\n"
+        )
+        cleaned = _strip_non_sha256_fingerprints(sdp)
+        # One sha-256 fingerprint per m-section, none of the other algorithms.
+        assert cleaned.count("a=fingerprint:") == 2
+        assert "sha-384" not in cleaned and "sha-512" not in cleaned
+        assert cleaned.count("a=fingerprint:sha-256 AA:BB") == 2
+        # Non-fingerprint lines survive untouched, and no blank lines are left
+        # behind where the removed lines were.
+        assert "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" in cleaned
+        assert "a=setup:active\r\n" in cleaned
+        assert "\r\n\r\n" not in cleaned
+
+    def test_keeps_single_sha256_fingerprint_untouched(self):
+        sdp = "v=0\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=fingerprint:sha-256 AA:BB\r\n"
+        assert _strip_non_sha256_fingerprints(sdp) == sdp
+
+    def test_leaves_sdp_without_fingerprints_untouched(self):
+        sdp = "v=0\r\nt=0 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=setup:active\r\n"
+        assert _strip_non_sha256_fingerprints(sdp) == sdp
+
+
+# ---------------------------------------------------------------------------
+# ICE host-candidate restriction (SPEECH_TO_SPEECH_ICE_ADDRESSES)
+# ---------------------------------------------------------------------------
+
+
+class TestIceAddressFilter:
+    def test_restricts_host_addresses_to_configured_networks(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        monkeypatch.setenv(webrtc_session_module.ICE_ADDRESSES_ENV, "192.168.0.112, 10.0.0.0/8")
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_networks", None)
+        monkeypatch.setattr(
+            aioice_ice,
+            "get_host_addresses",
+            lambda use_ipv4, use_ipv6: [
+                "192.168.0.112",  # Ethernet
+                "192.168.1.9",  # other LAN subnet
+                "100.120.84.114",  # Tailscale
+                "172.31.80.1",  # WSL/Hyper-V vNIC
+                "169.254.70.139",  # APIPA link-local
+                "10.0.0.5",  # inside 10.0.0.0/8
+            ],
+        )
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses(True, False) == ["192.168.0.112", "10.0.0.5"]
+
+    def test_unset_env_leaves_aioice_untouched(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        original = aioice_ice.get_host_addresses
+        monkeypatch.delenv(webrtc_session_module.ICE_ADDRESSES_ENV, raising=False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses is original
+
+    def test_invalid_entry_fails_open(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        original = aioice_ice.get_host_addresses
+        monkeypatch.setenv(webrtc_session_module.ICE_ADDRESSES_ENV, "not-an-ip")
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses is original
+
+    def test_install_is_idempotent(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        monkeypatch.setenv(webrtc_session_module.ICE_ADDRESSES_ENV, "192.168.0.112")
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_networks", None)
+        monkeypatch.setattr(
+            aioice_ice,
+            "get_host_addresses",
+            lambda use_ipv4, use_ipv6: ["192.168.0.112", "100.120.84.114"],
+        )
+
+        webrtc_session_module.install_ice_address_filter()
+        first = aioice_ice.get_host_addresses
+        webrtc_session_module.install_ice_address_filter()  # second call must not re-wrap
+
+        assert aioice_ice.get_host_addresses is first
+        assert aioice_ice.get_host_addresses(True, False) == ["192.168.0.112"]
+
+    def test_ipv6_address_filtered_by_ipv4_only_config(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        monkeypatch.setenv(webrtc_session_module.ICE_ADDRESSES_ENV, "192.168.0.0/24")
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_networks", None)
+        monkeypatch.setattr(
+            aioice_ice,
+            "get_host_addresses",
+            lambda use_ipv4, use_ipv6: ["192.168.0.112", "fd7a:115c:a1e0::5e34:5472"],
+        )
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses(True, True) == ["192.168.0.112"]
 
 
 # ---------------------------------------------------------------------------

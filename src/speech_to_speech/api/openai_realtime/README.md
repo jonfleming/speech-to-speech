@@ -109,6 +109,14 @@ export SPEECH_TO_SPEECH_ICE_SERVERS='[{"urls": "stun:stun.example.com:3478"}, {"
 
 Without it, aiortc defaults apply (host candidates + Google STUN). Deployments where clients cannot reach the server directly (symmetric NAT, containers without exposed UDP) need a TURN server.
 
+By default aiortc gathers a host candidate on **every** network interface. On multi-adapter machines (Tailscale, WSL/Hyper-V vNICs, APIPA link-local) that advertises unusable candidates to the client and stalls ICE for ~20 s per unreachable candidate pair. Restrict host candidates to specific IPs/CIDRs with `SPEECH_TO_SPEECH_ICE_ADDRESSES` (comma/space-separated):
+
+```bash
+export SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112, 192.168.0.0/24'
+```
+
+Only host candidates inside the listed networks are gathered and advertised, so a LAN-only client (e.g. an ESP32) sees just the reachable adapter and ICE completes immediately.
+
 ---
 
 ## Tool Calling Design
