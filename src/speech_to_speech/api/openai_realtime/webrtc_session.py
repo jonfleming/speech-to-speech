@@ -246,6 +246,8 @@ class WebRTCSession(SessionTransport):
         """
         await self._pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
         answer = await self._pc.createAnswer()
+        logger.info("[WebRTC] answer: %s", answer)
+        logger.info("[WebRTC] sdp: %s", answer.sdp)
         await self._pc.setLocalDescription(answer)
 
         if self._pc.iceGatheringState != "complete":

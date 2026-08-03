@@ -29,6 +29,15 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": ["--host", "localhost"]
+        },
+        {
+            "name": "listen_and_play_realtime",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/listen_and_play_realtime.py",
+            "console": "integratedTerminal",
+            "args": ["--host", "https://speech.fleming.ai", "--base-url", "https://speech.fleming.ai/v1", "--websocket-base-url", "wss://speech.fleming.ai/v1"]
         }
+
     ]
 }

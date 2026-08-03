@@ -155,6 +155,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             connect=min(10.0, self.request_timeout_s),
         )
 
+        # Fall back to environment variable if api_key not provided
+        if api_key is None:
+            api_key = os.environ.get("OPENAI_API_KEY")
+        if api_key is None:
+            raise ValueError(
+                "api_key must be set either via argument or OPENAI_API_KEY environment variable"
+            )
+
         self.user_role = user_role
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
