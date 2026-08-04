@@ -290,6 +290,49 @@ class TestIceAddressFilter:
         assert aioice_ice.get_host_addresses is first
         assert aioice_ice.get_host_addresses(True, False) == ["192.168.0.112"]
 
+    def test_quoted_env_values_are_tolerated(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        # Windows `set VAR='192.168.0.112'` stores the quotes literally; bash
+        # strips them. Both spellings must parse.
+        monkeypatch.setenv(
+            webrtc_session_module.ICE_ADDRESSES_ENV,
+            "'192.168.0.112' \"10.0.0.0/8\"",
+        )
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_networks", None)
+        monkeypatch.setattr(
+            aioice_ice,
+            "get_host_addresses",
+            lambda use_ipv4, use_ipv6: ["192.168.0.112", "10.0.0.5", "100.120.84.114"],
+        )
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses(True, False) == ["192.168.0.112", "10.0.0.5"]
+
+    def test_quote_only_tokens_are_skipped(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        # A quote-only token (an empty value wrapped in quotes) must be
+        # skipped, not treated as an invalid entry that fails open.
+        monkeypatch.setenv(webrtc_session_module.ICE_ADDRESSES_ENV, "'' 192.168.0.112")
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_networks", None)
+        monkeypatch.setattr(
+            aioice_ice,
+            "get_host_addresses",
+            lambda use_ipv4, use_ipv6: ["192.168.0.112", "100.120.84.114"],
+        )
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses(True, False) == ["192.168.0.112"]
+
     def test_ipv6_address_filtered_by_ipv4_only_config(self, monkeypatch):
         import aioice.ice as aioice_ice
 

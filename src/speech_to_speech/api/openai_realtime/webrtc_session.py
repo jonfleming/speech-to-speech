@@ -88,6 +88,11 @@ def install_ice_address_filter() -> None:
 
     networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for token in raw.replace(",", " ").split():
+        # Windows `set` stores surrounding quotes literally (cmd does not
+        # strip them the way bash does), so tolerate '192.168.0.112' / "…".
+        token = token.strip().strip("'\"")
+        if not token:
+            continue
         try:
             networks.append(ipaddress.ip_network(token, strict=False))
         except ValueError:

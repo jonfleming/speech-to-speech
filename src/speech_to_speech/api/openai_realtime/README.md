@@ -115,6 +115,8 @@ By default aiortc gathers a host candidate on **every** network interface. On mu
 export SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112, 192.168.0.0/24'
 ```
 
+Surrounding quotes are tolerated — Windows `cmd` stores them literally, so `set SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112'` works as-is (PowerShell: `$env:SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112'`).
+
 Only host candidates inside the listed networks are gathered and advertised, so a LAN-only client (e.g. an ESP32) sees just the reachable adapter and ICE completes immediately.
 
 ---
