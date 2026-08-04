@@ -75,6 +75,8 @@ SESSION_END_DRAIN_TIMEOUT_S = 10.0
 # the pool; a dead handler keeps it quarantined forever, visible in /v1/pool
 # as "stuck".
 SESSION_END_QUARANTINE_TIMEOUT_S = 180.0
+WEBRTC_PREEMPT_RECLAIM_TIMEOUT_S = 2.0
+MAX_LISTEN_REENABLE_DELAY_S = 30.0
 QItem = TypeVar("QItem")
 
 
@@ -278,11 +280,13 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
     finally:
         # Runs when the drain completed (chain proven clean) or the task is
         # cancelled at shutdown. Release unconditionally: even if unregister
-        # raises, the unit must not stay claimed forever.
+        # raises, the unit must not stay claimed forever. Guard against a
+        # newer claim replacing this session before the drain task finishes.
         try:
             _safe_unregister(unit, session_id)
         finally:
-            unit.session = None
+            if unit.session is session:
+                unit.session = None
         recovered = " after quarantine" if session.quarantined_at is not None else ""
         logger.info(f"Pipeline {unit.index} released{recovered} (session {session_id} ended)")
 
@@ -290,6 +294,40 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
 # Strong references to in-flight drain-and-release tasks (asyncio only
 # holds tasks weakly); each task removes itself on completion.
 _release_tasks: set[asyncio.Task[None]] = set()
+
+
+def _cancel_pending_listen_enable(session: SessionState) -> None:
+    task = session.pending_listen_enable
+    if task is not None and not task.done():
+        task.cancel()
+    session.pending_listen_enable = None
+
+
+def _schedule_listen_reenable(
+    unit: PipelineUnit,
+    session: SessionState,
+    session_id: str,
+    delay_s: float,
+) -> None:
+    _cancel_pending_listen_enable(session)
+    bounded_delay_s = max(0.0, min(delay_s, MAX_LISTEN_REENABLE_DELAY_S))
+
+    async def _reenable() -> None:
+        try:
+            await asyncio.sleep(bounded_delay_s)
+        except asyncio.CancelledError:
+            return
+
+        if unit.session is session and session.session_id == session_id and session.released_at is None:
+            unit.should_listen.set()
+            logger.info(
+                "Pipeline %d: response playout tail drained, listening re-enabled",
+                unit.index,
+            )
+        if session.pending_listen_enable is asyncio.current_task():
+            session.pending_listen_enable = None
+
+    session.pending_listen_enable = asyncio.create_task(_reenable())
 
 
 def _release_session(unit: PipelineUnit, session_id: str) -> None:
@@ -304,6 +342,7 @@ def _release_session(unit: PipelineUnit, session_id: str) -> None:
     if old_session is None:
         # Already released (e.g. duplicate close callbacks racing).
         return
+    _cancel_pending_listen_enable(old_session)
     old_session.released_at = time.monotonic()
     _clean_unit(unit)
     # Tag SESSION_END with this session's id so that, after a force
@@ -394,6 +433,8 @@ async def _dispatch_client_event(
         was_active = service._state(session_id).in_response
         if was_active:
             unit.cancel_scope.cancel()
+        if unit.session is not None:
+            _cancel_pending_listen_enable(unit.session)
         _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
         _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
         transport.discard_pending_audio()
@@ -438,6 +479,72 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
             if unit.session is None:
                 unit.session = SessionState(transport=transport)
                 return unit
+        return None
+
+    async def _claim_webrtc_unit() -> PipelineUnit | None:
+        unit = _claim_unit(None)
+        if unit is not None:
+            return unit
+
+        # Single-client embedded deployments (pool size 1) can reconnect after
+        # a device reboot before ICE consent timeout by preempting the stale
+        # peer connection from the previous call.
+        if len(pool) != 1:
+            return None
+
+        occupied = pool[0]
+        session = occupied.session
+        if (
+            session is None
+            or session.released_at is not None
+            or session.transport is None
+            or session.transport.kind != "webrtc"
+        ):
+            return None
+
+        stale_session_id = session.session_id
+        logger.warning(
+            "Preempting active WebRTC session %s on pipeline %d to accept a new SDP offer",
+            stale_session_id,
+            occupied.index,
+        )
+        try:
+            await session.transport.close()
+        except Exception:
+            logger.exception(
+                "Pipeline %d: failed to close stale WebRTC session %s during preempt",
+                occupied.index,
+                stale_session_id,
+            )
+
+        deadline = time.monotonic() + WEBRTC_PREEMPT_RECLAIM_TIMEOUT_S
+        while time.monotonic() < deadline:
+            unit = _claim_unit(None)
+            if unit is not None:
+                logger.info(
+                    "Preempted WebRTC session %s; reclaimed pipeline %d for new call",
+                    stale_session_id,
+                    unit.index,
+                )
+                return unit
+            await asyncio.sleep(0.05)
+
+        # Fixture and degraded-chain fallback: if the regular drain path has
+        # already marked this exact session as released but SESSION_END cannot
+        # propagate promptly, reclaim explicitly so a reconnect is not blocked
+        # behind a long consent/drain timeout.
+        latest = occupied.session
+        if latest is session and latest.released_at is not None:
+            logger.warning(
+                "Pipeline %d: forcing reclaim of stale WebRTC session %s after %.1fs preempt wait",
+                occupied.index,
+                stale_session_id,
+                WEBRTC_PREEMPT_RECLAIM_TIMEOUT_S,
+            )
+            _safe_unregister(occupied, stale_session_id)
+            _clean_unit(occupied)
+            occupied.session = None
+            return _claim_unit(None)
         return None
 
     @app.websocket("/v1/realtime")
@@ -583,7 +690,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
         # Claim with a placeholder transport; the send loop tolerates a
         # transport-less snapshot until the session object below is attached.
-        unit = _claim_unit(None)
+        unit = await _claim_webrtc_unit()
         if unit is None:
             logger.warning(f"Rejected WebRTC offer: all {len(pool)} pipeline slots in use")
             return Response(
@@ -800,8 +907,25 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                             unit.service._state(session_id).response_pending = False
                         unit.response_playing.clear()
                         unit.cancel_scope.response_done(audio_generation)
-                        unit.should_listen.set()
-                        logger.info(f"Pipeline {unit.index}: response complete, listening re-enabled")
+                        playout_tail_s = 0.0
+                        if transport is not None:
+                            playout_tail_s = transport.pending_playout_seconds()
+                        if (
+                            session is not None
+                            and transport is not None
+                            and transport.kind == "webrtc"
+                            and playout_tail_s > 0
+                        ):
+                            unit.should_listen.clear()
+                            _schedule_listen_reenable(unit, session, session_id or "", playout_tail_s)
+                            logger.info(
+                                "Pipeline %d: response complete; delaying listen re-enable by %.2fs for playout tail",
+                                unit.index,
+                                playout_tail_s,
+                            )
+                        else:
+                            unit.should_listen.set()
+                            logger.info(f"Pipeline {unit.index}: response complete, listening re-enabled")
                         continue
 
                     # SESSION_END travels from input_queue through every handler to
@@ -853,7 +977,14 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
                     if not unit.response_playing.is_set():
                         unit.response_playing.set()
-                        unit.should_listen.set()
+                        if session is not None:
+                            _cancel_pending_listen_enable(session)
+                        if transport is not None and transport.kind == "webrtc":
+                            # Half-duplex on paced server-side playout: keep VAD
+                            # muted while assistant audio is playing.
+                            unit.should_listen.clear()
+                        else:
+                            unit.should_listen.set()
 
                     if transport is not None and session_id:
                         await transport.send_audio_chunk(unit.service, session_id, bytes(audio_batch))

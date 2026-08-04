@@ -47,6 +47,10 @@ class SessionTransport(ABC):
         """
 
     @abstractmethod
+    def pending_playout_seconds(self) -> float:
+        """Best-effort estimate of queued, not-yet-played outbound audio."""
+
+    @abstractmethod
     async def close(self) -> None: ...
 
 
@@ -92,6 +96,9 @@ class WebSocketTransport(SessionTransport):
         # Unplayed audio lives client-side over WebSocket; truncation is the
         # client's responsibility.
         pass
+
+    def pending_playout_seconds(self) -> float:
+        return 0.0
 
     async def close(self) -> None:
         try:

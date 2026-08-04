@@ -82,15 +82,20 @@ class _FakeTransport(SessionTransport):
     def __init__(self):
         self.sent: list[dict] = []
         self.discards = 0
+        self.audio_chunks: list[bytes] = []
+        self.playout_delay_s = 0.0
 
     async def send_events(self, events):
         self.sent.extend(e.model_dump() for e in events)
 
     async def send_audio_chunk(self, service, session_id, pcm):
-        raise AssertionError("dispatch tests never send audio")
+        self.audio_chunks.append(pcm)
 
     def discard_pending_audio(self):
         self.discards += 1
+
+    def pending_playout_seconds(self) -> float:
+        return self.playout_delay_s
 
     async def close(self):
         pass
@@ -520,6 +525,38 @@ class TestBargeInAfterResponseDone:
         stop_event.set()
 
 
+class TestWebRTCPlayoutTailListening:
+    def test_listening_reenabled_after_estimated_playout_tail(self):
+        unit = _make_unit()
+        stop_event = ThreadingEvent()
+        app = router_module.create_app(pool=[unit], stop_event=stop_event)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+
+                spy = _FakeTransport()
+                spy.playout_delay_s = 0.25
+                assert unit.session is not None
+                unit.session.transport = spy
+
+                unit.output_queue.put(b"\x01\x00" * 2048)
+                unit.output_queue.put(AUDIO_RESPONSE_DONE)
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not spy.audio_chunks:
+                    time.sleep(0.02)
+                assert spy.audio_chunks
+
+                time.sleep(0.05)
+                assert not unit.should_listen.is_set()
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not unit.should_listen.is_set():
+                    time.sleep(0.02)
+                assert unit.should_listen.is_set()
+        stop_event.set()
+
+
 # ---------------------------------------------------------------------------
 # Loopback integration: real aiortc peer against the served app
 # ---------------------------------------------------------------------------
@@ -658,18 +695,24 @@ class TestWebRTCLoopback:
             )
         assert resp.status_code == 415
 
-    async def test_rejects_when_pool_full(self, server_env):
-        pc = RTCPeerConnection()
+    async def test_new_offer_preempts_existing_webrtc_session_when_pool_size_is_one(self, server_env):
+        pc1 = RTCPeerConnection()
+        pc2 = RTCPeerConnection()
         try:
-            pc.createDataChannel("oai-events")
-            pc.addTrack(AudioStreamTrack())
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
+            pc1.createDataChannel("oai-events")
+            pc1.addTrack(AudioStreamTrack())
+            offer1 = await pc1.createOffer()
+            await pc1.setLocalDescription(offer1)
+
+            pc2.createDataChannel("oai-events")
+            pc2.addTrack(AudioStreamTrack())
+            offer2 = await pc2.createOffer()
+            await pc2.setLocalDescription(offer2)
 
             async with httpx.AsyncClient() as client:
                 first = await client.post(
                     f"http://127.0.0.1:{server_env.port}/v1/realtime/calls",
-                    content=pc.localDescription.sdp,
+                    content=pc1.localDescription.sdp,
                     headers={"Content-Type": "application/sdp"},
                     timeout=10.0,
                 )
@@ -677,14 +720,14 @@ class TestWebRTCLoopback:
 
                 second = await client.post(
                     f"http://127.0.0.1:{server_env.port}/v1/realtime/calls",
-                    content=pc.localDescription.sdp,
+                    content=pc2.localDescription.sdp,
                     headers={"Content-Type": "application/sdp"},
                     timeout=10.0,
                 )
-            assert second.status_code == 503
-            assert second.json()["error"]["type"] == "session_limit_reached"
+            assert second.status_code == 201
         finally:
-            await pc.close()
+            await pc1.close()
+            await pc2.close()
 
     async def test_delete_location_hangs_up(self, server_env):
         """DELETE on the Location URL advertised by the 201 releases the unit;

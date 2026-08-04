@@ -413,6 +413,12 @@ class WebRTCSession(SessionTransport):
     def discard_pending_audio(self) -> None:
         self._track.clear()
 
+    def pending_playout_seconds(self) -> float:
+        # Track buffer is mono s16 PCM at 48 kHz. Include one ptime to account
+        # for the frame currently being paced out by recv().
+        buffered = self._track.buffered_bytes / (WEBRTC_SAMPLE_RATE * 2)
+        return max(0.0, buffered + AUDIO_PTIME)
+
     # ── Internals ─────────────────────────────────
 
     def _spawn(self, coro: Awaitable[None]) -> None:
