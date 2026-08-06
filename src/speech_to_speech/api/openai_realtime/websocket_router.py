@@ -76,7 +76,6 @@ SESSION_END_DRAIN_TIMEOUT_S = 10.0
 # as "stuck".
 SESSION_END_QUARANTINE_TIMEOUT_S = 180.0
 WEBRTC_PREEMPT_RECLAIM_TIMEOUT_S = 2.0
-MAX_LISTEN_REENABLE_DELAY_S = 30.0
 QItem = TypeVar("QItem")
 
 
@@ -310,11 +309,11 @@ def _schedule_listen_reenable(
     delay_s: float,
 ) -> None:
     _cancel_pending_listen_enable(session)
-    bounded_delay_s = max(0.0, min(delay_s, MAX_LISTEN_REENABLE_DELAY_S))
+    reenable_delay_s = max(0.0, delay_s)
 
     async def _reenable() -> None:
         try:
-            await asyncio.sleep(bounded_delay_s)
+            await asyncio.sleep(reenable_delay_s)
         except asyncio.CancelledError:
             return
 

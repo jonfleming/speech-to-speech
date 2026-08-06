@@ -556,6 +556,27 @@ class TestWebRTCPlayoutTailListening:
                 assert unit.should_listen.is_set()
         stop_event.set()
 
+    async def test_reenable_scheduler_preserves_full_delay(self, monkeypatch):
+        unit = _make_unit()
+        session = router_module.SessionState(session_id="session_test")
+        unit.session = session
+
+        seen: list[float] = []
+        original_sleep = router_module.asyncio.sleep
+
+        async def _fake_sleep(delay: float):
+            seen.append(delay)
+            await original_sleep(0)
+
+        monkeypatch.setattr(router_module.asyncio, "sleep", _fake_sleep)
+
+        router_module._schedule_listen_reenable(unit, session, session.session_id, 32.36)
+        assert session.pending_listen_enable is not None
+        await session.pending_listen_enable
+
+        assert seen == [32.36]
+        assert unit.should_listen.is_set()
+
 
 # ---------------------------------------------------------------------------
 # Loopback integration: real aiortc peer against the served app
