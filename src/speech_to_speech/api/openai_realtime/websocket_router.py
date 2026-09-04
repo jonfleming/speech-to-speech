@@ -83,6 +83,7 @@ SESSION_END_DRAIN_TIMEOUT_S = 10.0
 # the pool; a dead handler keeps it quarantined forever, visible in /v1/pool
 # as "stuck".
 SESSION_END_QUARANTINE_TIMEOUT_S = 180.0
+WEBRTC_PREEMPT_RECLAIM_TIMEOUT_S = 2.0
 QItem = TypeVar("QItem")
 
 
@@ -322,11 +323,13 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
     finally:
         # Runs when the drain completed (chain proven clean) or the task is
         # cancelled at shutdown. Release unconditionally: even if unregister
-        # raises, the unit must not stay claimed forever.
+        # raises, the unit must not stay claimed forever. Guard against a
+        # newer claim replacing this session before the drain task finishes.
         try:
             _safe_unregister(unit, session_id)
         finally:
-            unit.session = None
+            if unit.session is session:
+                unit.session = None
         recovered = " after quarantine" if session.quarantined_at is not None else ""
         logger.info(f"Pipeline {unit.index} released{recovered} (session {session_id} ended)")
 
@@ -538,6 +541,72 @@ def create_app(
                 return unit
         return None
 
+    async def _claim_webrtc_unit() -> PipelineUnit | None:
+        unit = _claim_unit(None)
+        if unit is not None:
+            return unit
+
+        # Single-client embedded deployments (pool size 1) can reconnect after
+        # a device reboot before ICE consent timeout by preempting the stale
+        # peer connection from the previous call.
+        if len(pool) != 1:
+            return None
+
+        occupied = pool[0]
+        session = occupied.session
+        if (
+            session is None
+            or session.released_at is not None
+            or session.transport is None
+            or session.transport.kind != "webrtc"
+        ):
+            return None
+
+        stale_session_id = session.session_id
+        logger.warning(
+            "Preempting active WebRTC session %s on pipeline %d to accept a new SDP offer",
+            stale_session_id,
+            occupied.index,
+        )
+        try:
+            await session.transport.close()
+        except Exception:
+            logger.exception(
+                "Pipeline %d: failed to close stale WebRTC session %s during preempt",
+                occupied.index,
+                stale_session_id,
+            )
+
+        deadline = time.monotonic() + WEBRTC_PREEMPT_RECLAIM_TIMEOUT_S
+        while time.monotonic() < deadline:
+            unit = _claim_unit(None)
+            if unit is not None:
+                logger.info(
+                    "Preempted WebRTC session %s; reclaimed pipeline %d for new call",
+                    stale_session_id,
+                    unit.index,
+                )
+                return unit
+            await asyncio.sleep(0.05)
+
+        # Fixture and degraded-chain fallback: if the regular drain path has
+        # already marked this exact session as released but SESSION_END cannot
+        # propagate promptly, reclaim explicitly so a reconnect is not blocked
+        # behind a long consent/drain timeout.
+        latest = occupied.session
+        if latest is session and latest.released_at is not None:
+            logger.warning(
+                "Pipeline %d: forcing reclaim of stale WebRTC session %s after %.1fs preempt wait",
+                occupied.index,
+                stale_session_id,
+                WEBRTC_PREEMPT_RECLAIM_TIMEOUT_S,
+            )
+            _safe_unregister(occupied, stale_session_id)
+            _clean_unit(occupied)
+            occupied.session = None
+            return _claim_unit(None)
+        return None
+
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:
         offered_subprotocols = {
@@ -687,7 +756,7 @@ def create_app(
 
         # Claim with a placeholder transport; the send loop tolerates a
         # transport-less snapshot until the session object below is attached.
-        unit = _claim_unit(None)
+        unit = await _claim_webrtc_unit()
         if unit is None:
             logger.warning(f"Rejected WebRTC offer: all {len(pool)} pipeline slots in use")
             return Response(

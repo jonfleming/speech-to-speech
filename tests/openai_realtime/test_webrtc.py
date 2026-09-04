@@ -17,6 +17,7 @@ The whole module is skipped when the ``webrtc`` extra (aiortc) isn't installed.
 
 import asyncio
 import json
+import re
 import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
@@ -43,6 +44,8 @@ from speech_to_speech.api.openai_realtime.webrtc_session import (  # noqa: E402
     PcmResampler,
     PipelineAudioTrack,
     WebRTCSession,
+    _prioritize_ice_candidates,
+    _strip_non_sha256_fingerprints,
 )
 from speech_to_speech.pipeline.cancel_scope import CancelScope  # noqa: E402
 from speech_to_speech.pipeline.events import (  # noqa: E402
@@ -183,6 +186,245 @@ class TestPcmResampler:
         samples = np.frombuffer(bytes(total), dtype=np.int16)
         # 5120 samples at 16 kHz → ~15360 at 48 kHz, minus filter delay.
         assert 15000 <= samples.shape[0] <= 15360
+
+
+# ---------------------------------------------------------------------------
+# Answer SDP sanitization (single sha-256 fingerprint for embedded clients)
+# ---------------------------------------------------------------------------
+
+
+class TestFingerprintSanitization:
+    def test_strips_non_sha256_fingerprints_from_every_msection(self):
+        sdp = (
+            "v=0\r\n"
+            "o=- 1 1 IN IP4 0.0.0.0\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            "a=mid:audio\r\n"
+            "a=fingerprint:sha-256 AA:BB\r\n"
+            "a=fingerprint:sha-384 CC:DD\r\n"
+            "a=fingerprint:sha-512 EE:FF\r\n"
+            "a=setup:active\r\n"
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            "a=mid:datachannel\r\n"
+            "a=fingerprint:sha-256 AA:BB\r\n"
+            "a=fingerprint:sha-384 CC:DD\r\n"
+            "a=fingerprint:sha-512 EE:FF\r\n"
+            "a=setup:active\r\n"
+        )
+        cleaned = _strip_non_sha256_fingerprints(sdp)
+        # One sha-256 fingerprint per m-section, none of the other algorithms.
+        assert cleaned.count("a=fingerprint:") == 2
+        assert "sha-384" not in cleaned and "sha-512" not in cleaned
+        assert cleaned.count("a=fingerprint:sha-256 AA:BB") == 2
+        # Non-fingerprint lines survive untouched, and no blank lines are left
+        # behind where the removed lines were.
+        assert "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" in cleaned
+        assert "a=setup:active\r\n" in cleaned
+        assert "\r\n\r\n" not in cleaned
+
+    def test_keeps_single_sha256_fingerprint_untouched(self):
+        sdp = "v=0\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=fingerprint:sha-256 AA:BB\r\n"
+        assert _strip_non_sha256_fingerprints(sdp) == sdp
+
+    def test_leaves_sdp_without_fingerprints_untouched(self):
+        sdp = "v=0\r\nt=0 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=setup:active\r\n"
+        assert _strip_non_sha256_fingerprints(sdp) == sdp
+
+
+# ---------------------------------------------------------------------------
+# ICE host-candidate restriction (SPEECH_TO_SPEECH_ICE_ADDRESSES)
+# ---------------------------------------------------------------------------
+
+
+class TestIceAddressFilter:
+    def test_restricts_host_addresses_to_configured_networks(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        monkeypatch.setenv(webrtc_session_module.ICE_ADDRESSES_ENV, "192.168.0.112, 10.0.0.0/8")
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_networks", None)
+        monkeypatch.setattr(
+            aioice_ice,
+            "get_host_addresses",
+            lambda use_ipv4, use_ipv6: [
+                "192.168.0.112",
+                "192.168.1.9",
+                "100.120.84.114",
+                "172.31.80.1",
+                "169.254.70.139",
+                "10.0.0.5",
+            ],
+        )
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses(True, False) == ["192.168.0.112", "10.0.0.5"]
+
+    def test_unset_env_leaves_aioice_untouched(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        original = aioice_ice.get_host_addresses
+        monkeypatch.delenv(webrtc_session_module.ICE_ADDRESSES_ENV, raising=False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses is original
+
+    def test_invalid_entry_fails_open(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        original = aioice_ice.get_host_addresses
+        monkeypatch.setenv(webrtc_session_module.ICE_ADDRESSES_ENV, "not-an-ip")
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses is original
+
+    def test_quoted_env_values_are_tolerated(self, monkeypatch):
+        import aioice.ice as aioice_ice
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        monkeypatch.setenv(
+            webrtc_session_module.ICE_ADDRESSES_ENV,
+            "'192.168.0.112' \"10.0.0.0/8\"",
+        )
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_installed", False)
+        monkeypatch.setattr(webrtc_session_module, "_address_filter_networks", None)
+        monkeypatch.setattr(
+            aioice_ice,
+            "get_host_addresses",
+            lambda use_ipv4, use_ipv6: ["192.168.0.112", "10.0.0.5", "100.120.84.114"],
+        )
+
+        webrtc_session_module.install_ice_address_filter()
+
+        assert aioice_ice.get_host_addresses(True, False) == ["192.168.0.112", "10.0.0.5"]
+
+
+# ---------------------------------------------------------------------------
+# Answer SDP candidate order (IPv4 host first for LAN DTLS)
+# ---------------------------------------------------------------------------
+
+
+class TestCandidatePrioritization:
+    def test_puts_ipv4_host_then_srflx_then_relay_and_rewrites_c_line(self):
+        sdp = (
+            "v=0\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            "c=IN IP6 fd7a:115c:a1e0::1\r\n"
+            "a=candidate:host6 1 udp 2130706431 fd7a:115c:a1e0::1 9 typ host\r\n"
+            "a=candidate:host4 1 udp 2130706431 192.168.0.112 9 typ host\r\n"
+            "a=candidate:srflx 1 udp 1694498815 50.47.198.12 9 typ srflx raddr 192.168.0.112 rport 9\r\n"
+            "a=candidate:relay 1 udp 16777215 89.117.23.155 9 typ relay raddr 192.168.0.112 rport 9\r\n"
+            "a=end-of-candidates\r\n"
+        )
+        rewritten = _prioritize_ice_candidates(sdp)
+        audio = rewritten.split("m=audio", 1)[1]
+        types = re.findall(r" typ (\S+)", audio)
+        assert types == ["host", "srflx", "relay", "host"]
+        assert "c=IN IP4 192.168.0.112" in rewritten
+        assert "c=IN IP6 fd7a:115c:a1e0::1" not in rewritten
+
+    def test_reorders_every_msection_independently(self):
+        sdp = (
+            "v=0\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            "a=candidate:h 1 udp 1 192.168.0.112 9 typ host\r\n"
+            "a=candidate:r 1 udp 1 89.117.23.155 9 typ relay\r\n"
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            "a=candidate:h 1 udp 1 192.168.0.112 9 typ host\r\n"
+            "a=candidate:r 1 udp 1 89.117.23.155 9 typ relay\r\n"
+        )
+        rewritten = _prioritize_ice_candidates(sdp)
+        sections = rewritten.split("m=")[1:]
+        for section in sections:
+            types = re.findall(r" typ (\S+)", section)
+            assert types == ["host", "relay"]
+
+    def test_leaves_sdp_without_candidates_untouched(self):
+        sdp = "v=0\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=setup:active\r\n"
+        assert _prioritize_ice_candidates(sdp) == sdp
+
+
+class TestTurnDataIndicationPatch:
+    def test_registers_data_attribute_and_is_idempotent(self):
+        from aioice import stun
+
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        webrtc_session_module.install_turn_data_indication_support()
+        webrtc_session_module.install_turn_data_indication_support()
+        assert "DATA" in stun.ATTRIBUTES_BY_NAME
+        assert 0x0013 in stun.ATTRIBUTES_BY_TYPE
+
+        message = stun.Message(message_method=stun.Method.DATA, message_class=stun.Class.INDICATION)
+        message.attributes["XOR-PEER-ADDRESS"] = ("89.117.23.155", 63878)
+        message.attributes["DATA"] = b"ice-check"
+        parsed = stun.parse_message(bytes(message))
+        assert parsed.message_method == stun.Method.DATA
+        assert parsed.attributes["DATA"] == b"ice-check"
+        assert parsed.attributes["XOR-PEER-ADDRESS"] == ("89.117.23.155", 63878)
+
+
+class TestStunCompanionServers:
+    def test_adds_stun_url_for_each_turn_url(self):
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        servers = webrtc_session_module._ice_servers_with_stun_companions(
+            [{"urls": "turn:turn.techion.net:3478", "username": "u", "credential": "c"}]
+        )
+        urls = []
+        for server in servers:
+            value = server.urls
+            urls.extend([value] if isinstance(value, str) else list(value))
+        assert "turn:turn.techion.net:3478" in urls
+        assert "stun:turn.techion.net:3478" in urls
+
+    def test_does_not_duplicate_existing_stun(self):
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        servers = webrtc_session_module._ice_servers_with_stun_companions(
+            [
+                {"urls": "stun:turn.techion.net:3478"},
+                {"urls": "turn:turn.techion.net:3478", "username": "u", "credential": "c"},
+            ]
+        )
+        urls = []
+        for server in servers:
+            value = server.urls
+            urls.extend([value] if isinstance(value, str) else list(value))
+        assert urls.count("stun:turn.techion.net:3478") == 1
+
+
+class TestParseIceServerEntries:
+    def test_drops_turn_entry_without_credentials(self):
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        entries = webrtc_session_module._parse_ice_server_entries(
+            '[{"urls": "turn:turn.techion.net"},'
+            '{"urls": "turn:turn.techion.net", "username": "realtime", "credential": "secret"}]'
+        )
+        assert len(entries) == 1
+        assert entries[0]["username"] == "realtime"
+
+    def test_strips_wrapping_quotes_from_windows_set(self):
+        import speech_to_speech.api.openai_realtime.webrtc_session as webrtc_session_module
+
+        entries = webrtc_session_module._parse_ice_server_entries(
+            '\'[{"urls": "stun:stun.example.com:3478"}]\''
+        )
+        assert entries == [{"urls": "stun:stun.example.com:3478"}]
 
 
 # ---------------------------------------------------------------------------
@@ -716,18 +958,24 @@ class TestWebRTCLoopback:
             )
         assert resp.status_code == 415
 
-    async def test_rejects_when_pool_full(self, server_env):
-        pc = RTCPeerConnection()
+    async def test_new_offer_preempts_existing_webrtc_session_when_pool_size_is_one(self, server_env):
+        pc1 = RTCPeerConnection()
+        pc2 = RTCPeerConnection()
         try:
-            pc.createDataChannel("oai-events")
-            pc.addTrack(AudioStreamTrack())
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
+            pc1.createDataChannel("oai-events")
+            pc1.addTrack(AudioStreamTrack())
+            offer1 = await pc1.createOffer()
+            await pc1.setLocalDescription(offer1)
+
+            pc2.createDataChannel("oai-events")
+            pc2.addTrack(AudioStreamTrack())
+            offer2 = await pc2.createOffer()
+            await pc2.setLocalDescription(offer2)
 
             async with httpx.AsyncClient() as client:
                 first = await client.post(
                     f"http://127.0.0.1:{server_env.port}/v1/realtime/calls",
-                    content=pc.localDescription.sdp,
+                    content=pc1.localDescription.sdp,
                     headers={"Content-Type": "application/sdp"},
                     timeout=10.0,
                 )
@@ -735,14 +983,14 @@ class TestWebRTCLoopback:
 
                 second = await client.post(
                     f"http://127.0.0.1:{server_env.port}/v1/realtime/calls",
-                    content=pc.localDescription.sdp,
+                    content=pc2.localDescription.sdp,
                     headers={"Content-Type": "application/sdp"},
                     timeout=10.0,
                 )
-            assert second.status_code == 503
-            assert second.json()["error"]["type"] == "session_limit_reached"
+            assert second.status_code == 201
         finally:
-            await pc.close()
+            await pc1.close()
+            await pc2.close()
 
     async def test_delete_location_hangs_up(self, server_env):
         """DELETE on the Location URL advertised by the 201 releases the unit;

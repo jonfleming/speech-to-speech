@@ -155,7 +155,41 @@ ICE servers (STUN/TURN) can be configured via the `SPEECH_TO_SPEECH_ICE_SERVERS`
 export SPEECH_TO_SPEECH_ICE_SERVERS='[{"urls": "stun:stun.example.com:3478"}, {"urls": "turn:turn.example.com", "username": "u", "credential": "c"}]'
 ```
 
+On Windows `cmd.exe` do **not** include a credential-less `turn:` entry (coturn answers 401 and ICE never gets a public srflx). Use a single authenticated TURN URL; a STUN companion is added automatically:
+
+```bat
+set SPEECH_TO_SPEECH_ICE_SERVERS=[{"urls": "turn:turn.example.com:3478", "username": "realtime", "credential": "secret"}]
+set SPEECH_TO_SPEECH_ICE_ADDRESSES=192.168.0.112
+```
+
+PowerShell:
+
+```powershell
+$env:SPEECH_TO_SPEECH_ICE_SERVERS='[{"urls":"turn:turn.example.com:3478","username":"realtime","credential":"secret"}]'
+$env:SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112'
+```
+
 Without it, aiortc defaults apply (host candidates + Google STUN). Deployments where clients cannot reach the server directly (symmetric NAT, containers without exposed UDP) need a TURN server.
+
+By default aiortc gathers a host candidate on **every** network interface. On multi-adapter machines (Tailscale, WSL/Hyper-V vNICs, APIPA link-local) that advertises unusable candidates to the client and stalls ICE. Restrict host candidates to specific IPs/CIDRs with `SPEECH_TO_SPEECH_ICE_ADDRESSES` (comma/space-separated):
+
+```bash
+export SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112, 192.168.0.0/24'
+```
+
+Surrounding quotes are tolerated — Windows `cmd` stores them literally, so `set SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112'` works as-is (PowerShell: `$env:SPEECH_TO_SPEECH_ICE_ADDRESSES='192.168.0.112'`).
+
+The SDP answer lists IPv4 host candidates first, then srflx, then relay, then IPv6 host. Embedded ICE stacks (ESP32 libpeer) check pairs in list order rather than RFC 5245 priority. Same-LAN clients need host-host first so DTLS does not ride TURN (ICE can succeed on the relay pair while DTLS fails with mbedtls ``CONN_EOF``). A public srflx address is still advertised for remote TURN clients that cannot hairpin to coturn's own IP. Restrict host gathering with ``SPEECH_TO_SPEECH_ICE_ADDRESSES`` so the advertised host is the LAN NIC, not Tailscale/Docker.
+
+A `turn:` iceServers entry also gets a matching `stun:` URL so aiortc gathers that srflx candidate. Restrict host gathering with `SPEECH_TO_SPEECH_ICE_ADDRESSES` to the **LAN interface that NATs to the public internet** (for example `192.168.0.112`), not a Tailscale CGNAT address (`100.64.0.0/10`). STUN from Tailscale does not produce a usable public srflx.
+
+TURN-to-TURN on the same coturn host requires hairpin permissions. coturn returns `403 Forbidden IP` for CreatePermission/ChannelBind to its own public IP unless you allow it:
+
+```
+allowed-peer-ip=89.117.23.155
+```
+
+If `denied-peer-ip` already lists that address, remove it. Restart coturn after changing the config.
 
 ---
 
