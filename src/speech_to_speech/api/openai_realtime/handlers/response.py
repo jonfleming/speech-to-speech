@@ -27,6 +27,7 @@ from openai.types.realtime.realtime_response_status import RealtimeResponseStatu
 from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
+from speech_to_speech.api.openai_realtime.memory_followup import PendingMemoryFollowup
 from speech_to_speech.LLM.chat import ChatItemError, add_supported_item
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
@@ -184,6 +185,7 @@ class ResponseHandler(RealtimeBaseHandler):
             turn_id=st.speculative_user_turn_id,
             turn_revision=st.speculative_user_turn_revision,
             speech_stopped_at_s=st.speculative_user_speech_stopped_at_s,
+            session_id=conn_id,
             prefetch_transaction=ResponsePrefetchTransaction(),
         )
         st.tool_followup_prefetch_request = request
@@ -599,6 +601,7 @@ class ResponseHandler(RealtimeBaseHandler):
             turn_id=None if out_of_band else st.speculative_user_turn_id,
             turn_revision=None if out_of_band else st.speculative_user_turn_revision,
             speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
+            session_id=conn_id,
         )
         st.in_response = True
         st.clear_pending_response(request.response_key)
@@ -619,6 +622,96 @@ class ResponseHandler(RealtimeBaseHandler):
             event_id=self._next_event_id(),
             response=self._build_response(conn_id, "in_progress"),
         )
+
+    def enqueue_memory_followup(
+        self,
+        conn_id: str,
+        *,
+        text: str,
+        turn_id: str | None = None,
+        turn_revision: int | None = None,
+        origin_response_key: str | None = None,
+    ) -> tuple[str, list[ServerEvent]]:
+        """Accept a spoken follow-up from obsidian-memory.
+
+        If the origin response is still in progress, the words wait until it
+        finishes and then start a second realtime response on the TTS queue.
+        """
+        st = self._state(conn_id)
+        spoken = text.strip()
+        if not spoken:
+            return "empty", []
+        if turn_id and st.speculative_user_turn_id and turn_id != st.speculative_user_turn_id:
+            return "stale_turn", []
+        if (
+            turn_revision is not None
+            and st.speculative_user_turn_revision is not None
+            and turn_revision != st.speculative_user_turn_revision
+        ):
+            return "stale_turn", []
+        pending = PendingMemoryFollowup(
+            text=spoken,
+            turn_id=turn_id or st.speculative_user_turn_id,
+            turn_revision=turn_revision if turn_revision is not None else st.speculative_user_turn_revision,
+            origin_response_key=origin_response_key,
+        )
+        if st.in_response or st.response_pending:
+            st.pending_memory_followup = pending
+            logger.info("Queued memory follow-up until the current response finishes")
+            return "queued", []
+        return "started", self._start_prepared_response(conn_id, pending)
+
+    def maybe_start_memory_followup(self, conn_id: str, status: str) -> list[ServerEvent]:
+        st = self._state(conn_id)
+        pending = st.pending_memory_followup
+        if pending is None:
+            return []
+        if status != "completed":
+            st.pending_memory_followup = None
+            return []
+        if pending.turn_id and st.speculative_user_turn_id and pending.turn_id != st.speculative_user_turn_id:
+            st.pending_memory_followup = None
+            return []
+        if (
+            pending.turn_revision is not None
+            and st.speculative_user_turn_revision is not None
+            and pending.turn_revision != st.speculative_user_turn_revision
+        ):
+            st.pending_memory_followup = None
+            return []
+        if st.in_response or st.response_pending:
+            return []
+        st.pending_memory_followup = None
+        return self._start_prepared_response(conn_id, pending)
+
+    def _start_prepared_response(self, conn_id: str, pending: PendingMemoryFollowup) -> list[ServerEvent]:
+        st = self._state(conn_id)
+        queue = self._queue(conn_id)
+        request = GenerateResponseRequest(
+            runtime_config=st.runtime_config,
+            prepared_text=pending.text,
+            session_id=conn_id,
+            turn_id=pending.turn_id,
+            turn_revision=pending.turn_revision,
+            speech_stopped_at_s=st.speculative_user_speech_stopped_at_s,
+        )
+        st.in_response = True
+        st.clear_pending_response(request.response_key)
+        st.current_response_params = None
+        st.current_response_id = _generate_id("resp")
+        st.current_response_key = request.response_key
+        st.response_created_pending_key = request.response_key
+        self._start_item(conn_id)
+        if queue:
+            queue.put(request)
+        logger.info("Started memory follow-up response (%d chars)", len(pending.text))
+        return [
+            ResponseCreatedEvent(
+                type="response.created",
+                event_id=self._next_event_id(),
+                response=self._build_response(conn_id, "in_progress"),
+            )
+        ]
 
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
         """Cancel the in-progress response and re-enable listening."""
@@ -766,6 +859,7 @@ class ResponseHandler(RealtimeBaseHandler):
             )
         )
         events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        events.extend(self.maybe_start_memory_followup(conn_id, status))
         return events
 
     # ── Pipeline event handlers ───────────────────

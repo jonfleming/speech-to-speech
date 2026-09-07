@@ -47,6 +47,8 @@ from speech_to_speech.LLM.utils import (
     sent_tokenize_preserving_markdown_code,
 )
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
+from speech_to_speech.api.openai_realtime.memory_followup import memory_followup_headers
+from speech_to_speech.LLM.language_model import iter_prepared_speech
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
@@ -177,6 +179,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         audio_temperature: float = 0.0,
         audio_content_type: Literal["input_audio", "audio_url"] = "input_audio",
         audio_history_turns: int = 1,
+        memory_callback_url: str | None = None,
         **_kwargs: Any,
     ) -> None:
         self.cancel_scope = cancel_scope
@@ -199,6 +202,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             connect=min(10.0, self.request_timeout_s),
         )
 
+        self.memory_callback_url = (memory_callback_url or "").strip() or None
         self.user_role = user_role
         if (
             api_key is None
@@ -1044,6 +1048,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""
+        gen = self.cancel_scope.generation if self.cancel_scope else None
+        if request.prepared_text is not None:
+            yield from iter_prepared_speech(request, cancel_generation=gen)
+            return
         if request.audio is not None:
             yield from self._process_audio(request)
             return
@@ -1053,7 +1061,6 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         turn_id = request.turn_id
         turn_revision = request.turn_revision
         speech_stopped_at_s = request.speech_stopped_at_s
-        gen = self.cancel_scope.generation if self.cancel_scope else None
         if not self._turn_is_latest(turn_id, turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", turn_id, turn_revision)
             yield EndOfResponse(
@@ -1108,6 +1115,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self._apply_config(active_chat, instructions, wants_audio, language_name=lang_name)
 
         optional_kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
+        headers = memory_followup_headers(request, self.memory_callback_url)
+        if headers:
+            optional_kwargs["extra_headers"] = headers
 
         # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
         # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from

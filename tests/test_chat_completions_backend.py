@@ -985,6 +985,24 @@ def test_out_of_band_does_not_commit_to_default_conversation():
     assert not any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
 
 
+def test_prepared_text_skips_upstream_and_records_chat():
+    handler = _make_handler()
+    chat = Chat(10)
+    chat.add_item(make_user_message("remind me"))
+    request = GenerateResponseRequest(
+        runtime_config=RuntimeConfig(chat=chat),
+        prepared_text="From notes, we use Ollama.",
+        session_id="sess",
+        turn_id="turn",
+        turn_revision=1,
+    )
+    outputs = list(handler.process(request))
+    chunks = [item.text for item in outputs if isinstance(item, LLMResponseChunk)]
+    assert chunks == ["From notes, we use Ollama."]
+    assert isinstance(outputs[-1], EndOfResponse)
+    assert any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+
+
 # ── Standalone runner (no pytest required) ────────────────────────────────────
 
 if __name__ == "__main__":

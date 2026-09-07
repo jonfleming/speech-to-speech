@@ -341,6 +341,12 @@ def prepare_all_args(args: ParsedArguments) -> None:
     """Validate selectors and apply the global device to selected configs only."""
 
     prepare_module_args(args.module_kwargs, args.llm_backend)
+    llm_config = args.llm_backend.config
+    if "memory_callback_url" in llm_config and not llm_config.get("memory_callback_url"):
+        host = args.realtime_server_kwargs.host or "127.0.0.1"
+        if host in {"0.0.0.0", "::"}:
+            host = "127.0.0.1"
+        llm_config["memory_callback_url"] = f"http://{host}:{args.realtime_server_kwargs.port}/v1/memory/followup"
     if args.module_kwargs.device is None:
         return
     for field_name in ("stt_backend", "llm_backend", "tts_backend"):

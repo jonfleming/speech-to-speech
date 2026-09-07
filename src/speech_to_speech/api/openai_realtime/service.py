@@ -256,6 +256,7 @@ class ConnState(BaseModel):
     # frame has finished sending. Pipeline output is held behind this key so a
     # fast or already-buffered generation cannot overtake that lifecycle event.
     response_created_pending_key: str | None = None
+    pending_memory_followup: Any = None
 
     def mark_response_pending(self, response_key: str) -> None:
         """Track an implicit response from queueing until its first output."""
@@ -449,6 +450,9 @@ class RealtimeService:
     def handle_response_create(self, conn_id: str, event: ResponseCreateEvent) -> ServerEvent | None:
         return self.response.handle_response_create(conn_id, event)
 
+    def enqueue_memory_followup(self, conn_id: str, **kwargs) -> tuple[str, list[ServerEvent]]:
+        return self.response.enqueue_memory_followup(conn_id, **kwargs)
+
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
         return self.response.handle_response_cancel(conn_id)
 
@@ -465,6 +469,7 @@ class RealtimeService:
         """Cancel queued responses without losing usage already reported by their LMs."""
         st = self._state(conn_id)
         self.response.discard_tool_followup_prefetch(conn_id)
+        st.pending_memory_followup = None
         for response_key in tuple(st.pending_response_keys):
             st.runtime_config.chat.rollback_provisional_generation(response_key)
             self.close_response_key(conn_id, response_key)
@@ -675,6 +680,7 @@ class RealtimeService:
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
                 speech_stopped_at_s=event.speech_stopped_at_s,
+                session_id=conn_id,
             )
             st.mark_response_pending(request.response_key)
             queue.put(request)
@@ -721,6 +727,7 @@ class RealtimeService:
                 turn_id=event.turn_id,
                 turn_revision=event.turn_revision,
                 speech_stopped_at_s=event.speech_stopped_at_s,
+                session_id=conn_id,
             )
             st.mark_response_pending(request.response_key)
             queue.put(request)

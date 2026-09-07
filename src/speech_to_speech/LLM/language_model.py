@@ -161,6 +161,43 @@ class StreamContext(BaseModel):
         return self.cancelled or self.stopped
 
 
+def iter_prepared_speech(
+    request: GenerateResponseRequest,
+    *,
+    cancel_generation: int | None,
+) -> Iterator[LLMOut]:
+    """Speak already-generated text as a normal assistant response.
+
+    Used when obsidian-memory POSTs a follow-up: skip the upstream LLM and
+    enqueue the words through the usual TTS / realtime response path.
+    """
+    text = (request.prepared_text or "").strip()
+    if text and not is_out_of_band(request.response):
+        try:
+            request.runtime_config.chat.add_item(make_assistant_message(text))
+        except Exception:
+            log_exception(logger, "Failed to record prepared memory follow-up in chat")
+    if text:
+        yield LLMResponseChunk(
+            text=text,
+            language_code=request.language_code,
+            runtime_config=request.runtime_config,
+            response=request.response,
+            turn_id=request.turn_id,
+            turn_revision=request.turn_revision,
+            speech_stopped_at_s=request.speech_stopped_at_s,
+            cancel_generation=cancel_generation,
+            response_key=request.response_key,
+            prefetch_transaction=request.prefetch_transaction,
+        )
+    yield EndOfResponse(
+        turn_id=request.turn_id,
+        turn_revision=request.turn_revision,
+        cancel_generation=cancel_generation,
+        response_key=request.response_key,
+    )
+
+
 class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
     """Abstract base for text-only and vision language model handlers.
 
@@ -584,6 +621,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         gen = self.cancel_scope.generation if self.cancel_scope else None
         ctx.cancel_generation = gen
         ctx.prefetch_transaction = request.prefetch_transaction
+        if request.prepared_text is not None:
+            yield from iter_prepared_speech(request, cancel_generation=gen)
+            return
         if not self._turn_is_latest(ctx.turn_id, ctx.turn_revision):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", ctx.turn_id, ctx.turn_revision)
             yield EndOfResponse(

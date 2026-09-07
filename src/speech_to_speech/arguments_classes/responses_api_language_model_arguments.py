@@ -58,6 +58,14 @@ class ResponsesApiLanguageModelHandlerArguments(LanguageModelBaseArguments):
             "'audio_url' sends a base64 data URL. Default is 'input_audio'."
         },
     )
+    memory_callback_url: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "speech-to-speech URL that obsidian-memory can POST a second spoken reply to "
+            "(usually http://127.0.0.1:<realtime-port>/v1/memory/followup). When empty, serve "
+            "fills this from the realtime server port. Default is None."
+        },
+    )
     responses_api_audio_history_turns: int = field(
         default=1,
         metadata={

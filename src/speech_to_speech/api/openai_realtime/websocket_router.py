@@ -21,6 +21,7 @@ from openai.types.realtime import (
 )
 
 from speech_to_speech.api.openai_realtime.llm_proxy import LLMProxyConfig, mount_llm_proxy
+from speech_to_speech.api.openai_realtime.memory_followup import MemoryFollowupRequest
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import (
     PIPELINE_SAMPLE_RATE,
@@ -729,6 +730,38 @@ def create_app(
             "in_use": sum(1 for u in pool if u.session is not None),
             "units": [_state(u) for u in pool],
         }
+
+    @app.post("/v1/memory/followup")
+    async def memory_followup_endpoint(body: MemoryFollowupRequest) -> Any:
+        """obsidian-memory posts a second spoken reply here after retrieval."""
+        unit = next(
+            (item for item in pool if item.session is not None and item.session.session_id == body.session_id),
+            None,
+        )
+        if unit is None:
+            return Response(
+                content='{"error":{"message":"Unknown session","type":"session_not_found"}}',
+                status_code=404,
+                media_type="application/json",
+            )
+        status, events = unit.service.enqueue_memory_followup(
+            body.session_id,
+            text=body.text,
+            turn_id=body.turn_id,
+            turn_revision=body.turn_revision,
+            origin_response_key=body.origin_response_key,
+        )
+        if status == "stale_turn":
+            return {"accepted": False, "status": status}
+        transport = unit.session.transport if unit.session is not None else None
+        if events and transport is not None:
+            await transport.send_events(events)
+            if events and getattr(events[0], "type", None) == "response.created":
+                unit.service.response.mark_response_created_sent(
+                    body.session_id,
+                    unit.service._state(body.session_id).current_response_key,
+                )
+        return {"accepted": True, "status": status}
 
     @app.post("/v1/realtime/calls")
     async def webrtc_calls_endpoint(request: Request) -> Response:
