@@ -701,6 +701,12 @@ class ResponseHandler(RealtimeBaseHandler):
         st.current_response_id = _generate_id("resp")
         st.current_response_key = request.response_key
         st.response_created_pending_key = request.response_key
+        should_listen = self._should_listen(conn_id)
+        if should_listen is not None:
+            # Keep VAD off until the first follow-up audio chunk. The origin
+            # response already re-enabled listening for barge-in; a gap before
+            # this TTS starts would otherwise cancel the follow-up.
+            should_listen.clear()
         self._start_item(conn_id)
         if queue:
             queue.put(request)

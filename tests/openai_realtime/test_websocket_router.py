@@ -443,7 +443,11 @@ class TestClientEventDispatch:
                 output_queue.put(_pcm_bytes(256))
                 output_queue.put(AssistantOutputEvent(text="stale"))
                 ws.send_json({"type": "response.cancel"})
-                assert ws.receive_json()["type"] == "response.done"
+                types = []
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and "response.done" not in types:
+                    types.append(ws.receive_json()["type"])
+                assert "response.done" in types
                 time.sleep(0.1)
                 assert output_queue.empty()
                 assert text_output_queue.empty()
@@ -576,6 +580,42 @@ class TestSendLoop:
                 types = {msg3["type"], msg4["type"]}
                 assert "response.output_audio.done" in types
                 assert "response.done" in types
+
+    def test_queued_memory_followup_unblocks_audio_and_keeps_listening_off(self, setup):
+        """Follow-up audio must ship after origin response.done, without reopening VAD."""
+        app, service, _, output_queue, _, should_listen, _, response_playing, _ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = list(service._conns.keys())[0]
+                service.response._ensure_response(conn_id, "origin")
+                origin_key = service._state(conn_id).current_response_key
+                should_listen.clear()
+                status, events = service.enqueue_memory_followup(conn_id, text="You drive a Tesla Model 3.")
+                assert status == "queued"
+                assert events == []
+
+                output_queue.put(AudioOutput(audio=AUDIO_RESPONSE_DONE, response_key=origin_key))
+                types = []
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and "response.created" not in types:
+                    types.append(ws.receive_json()["type"])
+                assert "response.done" in types
+                assert "response.created" in types
+
+                followup_key = service._state(conn_id).current_response_key
+                assert followup_key not in (None, origin_key)
+                assert service._state(conn_id).response_created_pending_key is None
+                assert not service.response.is_response_output_blocked(conn_id, followup_key)
+                assert not should_listen.is_set()
+                assert not response_playing.is_set()
+
+                output_queue.put(AudioOutput(audio=_pcm_bytes(256), response_key=followup_key))
+                audio_types = []
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and "response.output_audio.delta" not in audio_types:
+                    audio_types.append(ws.receive_json()["type"])
+                assert "response.output_audio.delta" in audio_types
 
     def test_end_marker_sends_finish_events(self, setup):
         app, _, _, output_queue, *_ = setup

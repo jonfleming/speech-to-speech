@@ -184,6 +184,34 @@ def _discard_obsolete_response_key(unit: PipelineUnit, session_id: str, response
     logger.debug("Pipeline %d: discarded obsolete response %s output", unit.index, response_key)
 
 
+async def _emit_response_events(
+    transport: SessionTransport | None,
+    unit: PipelineUnit,
+    session_id: str | None,
+    events: list[Any],
+) -> None:
+    """Send lifecycle events and ungate output for a nested response.created."""
+    if transport is None or session_id is None or not events:
+        return
+    await transport.send_events(events)
+    if any(getattr(event, "type", None) == "response.created" for event in events):
+        unit.cancel_scope.new_response()
+        unit.service.response.mark_response_created_sent(
+            session_id,
+            unit.service._state(session_id).current_response_key,
+        )
+
+
+def _listening_after_response(unit: PipelineUnit, session_id: str | None) -> None:
+    """Re-enable VAD only when nothing else is still speaking."""
+    st = unit.service._state(session_id) if session_id else None
+    if st is not None and (st.in_response or st.response_pending):
+        logger.info("Pipeline %d: origin response complete, follow-up still in progress", unit.index)
+        return
+    unit.should_listen.set()
+    logger.info("Pipeline %d: response complete, listening re-enabled", unit.index)
+
+
 def _flush_queue(
     q: Queue[QItem],
     *,
@@ -754,13 +782,7 @@ def create_app(
         if status == "stale_turn":
             return {"accepted": False, "status": status}
         transport = unit.session.transport if unit.session is not None else None
-        if events and transport is not None:
-            await transport.send_events(events)
-            if events and getattr(events[0], "type", None) == "response.created":
-                unit.service.response.mark_response_created_sent(
-                    body.session_id,
-                    unit.service._state(body.session_id).current_response_key,
-                )
+        await _emit_response_events(transport, unit, body.session_id, events)
         return {"accepted": True, "status": status}
 
     @app.post("/v1/realtime/calls")
@@ -1055,7 +1077,12 @@ def create_app(
 
                     if _is_pipeline_end(audio_chunk):
                         if transport is not None and session_id:
-                            await transport.send_events(unit.service.finish_response(session_id))
+                            await _emit_response_events(
+                                transport,
+                                unit,
+                                session_id,
+                                unit.service.finish_response(session_id),
+                            )
                         break
 
                     if _is_audio_done(audio_chunk):
@@ -1100,15 +1127,17 @@ def create_app(
                             _discard_obsolete_response_key(unit, session_id, response_key)
                             continue
                         if transport is not None and session_id:
-                            await transport.send_events(
-                                unit.service.finish_response(session_id, response_key=response_key)
+                            await _emit_response_events(
+                                transport,
+                                unit,
+                                session_id,
+                                unit.service.finish_response(session_id, response_key=response_key),
                             )
                         if session_id:
                             unit.service._state(session_id).clear_pending_response(response_key)
                         unit.response_playing.clear()
                         unit.cancel_scope.response_done(audio_generation)
-                        unit.should_listen.set()
-                        logger.info(f"Pipeline {unit.index}: response complete, listening re-enabled")
+                        _listening_after_response(unit, session_id)
                         continue
 
                     # SESSION_END travels from input_queue through every handler to

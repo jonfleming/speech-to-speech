@@ -2156,6 +2156,36 @@ class TestHandleResponseCancel:
         assert events == []
 
 
+class TestMemoryFollowup:
+    def test_queues_while_origin_response_is_active(self, service, conn_id, should_listen):
+        should_listen.set()
+        service.response._ensure_response(conn_id)
+        status, events = service.enqueue_memory_followup(conn_id, text="You drive a Tesla Model 3.")
+        assert status == "queued"
+        assert events == []
+        assert should_listen.is_set()
+
+        done_events = service.finish_response(conn_id, status="completed")
+        types = [event.type for event in done_events]
+        assert "response.done" in types
+        assert "response.created" in types
+        st = service._state(conn_id)
+        assert st.in_response is True
+        assert st.response_created_pending_key == st.current_response_key
+        assert service.response.is_response_output_blocked(conn_id, st.current_response_key)
+        assert not should_listen.is_set()
+
+    def test_starts_immediately_when_idle(self, service, conn_id, should_listen):
+        should_listen.set()
+        status, events = service.enqueue_memory_followup(conn_id, text="You drive a Tesla Model 3.")
+        assert status == "started"
+        assert events[0].type == "response.created"
+        st = service._state(conn_id)
+        assert st.in_response is True
+        assert st.response_created_pending_key == st.current_response_key
+        assert not should_listen.is_set()
+
+
 # ===================================================================
 # Outbound audio encoding
 # ===================================================================
