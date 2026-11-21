@@ -66,6 +66,14 @@ class ResponsesApiLanguageModelHandlerArguments(LanguageModelBaseArguments):
             "fills this from the realtime server port. Default is None."
         },
     )
+    mcp_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to an MCP servers JSON file (see mcp_servers.example.json). Allowlisted tools from those "
+            "servers (calendar, mail, tasks, ...) are run by this server inside the LLM tool loop. Falls back to the "
+            "S2S_MCP_CONFIG environment variable. Default is None (no MCP tools)."
+        },
+    )
     responses_api_audio_history_turns: int = field(
         default=1,
         metadata={

@@ -232,3 +232,6 @@ uv.lock
 
 # JavaScript dependencies
 node_modules/
+
+# Local MCP tool config (template: mcp_servers.example.json)
+/mcp_servers.json

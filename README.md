@@ -507,6 +507,10 @@ speech-to-speech serve \
 
 Use `speech-to-speech local` when you want to run the same server and talk through the machine hosting it. In-process local backends are available with `--llm_backend mlx-lm` on Apple Silicon or `--llm_backend transformers` on CUDA / CPU.
 
+### Server-side MCP tools (calendar, mail, tasks)
+
+Pass `--mcp_config mcp_servers.json` and the LLM handler runs allowlisted tools from MCP servers itself (Google Calendar/Gmail via `workspace-mcp`, Todoist via `@todoist/mcp`), so clients that don't execute tools still get answers. Results are trimmed for voice, calls time out after 8 s, and write tools wait for a spoken "yes". Setup and config: [docs/mcp-tools.md](docs/mcp-tools.md).
+
 ## Offline Operation
 
 The pipeline can run without internet access after the dependencies and model assets for the selected components

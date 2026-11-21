@@ -21,6 +21,8 @@ from openai import OpenAI
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCall,
+    RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
 )
 from openai.types.realtime.realtime_conversation_item_assistant_message import (
     Content as AssistantContent,
@@ -49,6 +51,7 @@ from speech_to_speech.LLM.utils import (
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.api.openai_realtime.memory_followup import memory_followup_headers
 from speech_to_speech.LLM.language_model import iter_prepared_speech
+from speech_to_speech.LLM.mcp_tools import MCPToolRuntime, get_runtime, resolve_config_path
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
@@ -59,7 +62,7 @@ from speech_to_speech.pipeline.messages import (
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
-from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
+from speech_to_speech.utils.utils import _generate_id, is_out_of_band, response_wants_audio
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +130,8 @@ class _Turn(BaseModel):
     # End of the conversation when this turn started; keeps its output ahead of
     # user messages appended while the model was still running.
     history_anchor_id: str | None = None
+    # Conversation key for server-side MCP tools; None means MCP is off for this turn.
+    mcp_session_key: str | None = None
 
 
 class _GenState(BaseModel):
@@ -156,6 +161,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
     usage, out-of-band handling and error termination.
     """
 
+    # Server-side MCP tools; set in setup() when --mcp_config is given.
+    mcp: MCPToolRuntime | None = None
+
     # ── setup ─────────────────────────────────────────────────────────────────
 
     def setup(
@@ -180,6 +188,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         audio_content_type: Literal["input_audio", "audio_url"] = "input_audio",
         audio_history_turns: int = 1,
         memory_callback_url: str | None = None,
+        mcp_config: str | None = None,
         **_kwargs: Any,
     ) -> None:
         self.cancel_scope = cancel_scope
@@ -203,6 +212,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         )
 
         self.memory_callback_url = (memory_callback_url or "").strip() or None
+        # Server-side MCP tools (calendar, mail, tasks). None when not configured
+        # or when every server failed; the voice pipeline runs either way.
+        self.mcp: MCPToolRuntime | None = get_runtime(resolve_config_path(mcp_config))
         self.user_role = user_role
         if (
             api_key is None
@@ -799,6 +811,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     else:
                         api_response = make_request()
                         events = (event_iterator_fn or self._iter_events)(api_response)
+                if events is not None and turn.mcp_session_key is not None and self.mcp is not None:
+                    events = self._mcp_tool_loop(
+                        events,
+                        active_chat,
+                        optional_kwargs,
+                        turn,
+                        serialize_fn=serialize_fn,
+                        request_fn=request_fn,
+                        event_iterator_fn=event_iterator_fn,
+                    )
                 if events is not None:
                     if self.stream:
                         generation_completed = yield from self._consume_streaming(events, state, turn)
@@ -1097,6 +1119,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 return
         else:
             active_chat = original_chat.copy()
+        mcp_session_key: str | None = None
+        if self.mcp is not None and not is_out_of_band(response):
+            mcp_session_key = request.session_id or f"chat-{id(original_chat)}"
+            spoken = self._mcp_resolve_pending(mcp_session_key, original_chat)
+            if spoken is not None:
+                yield from iter_prepared_speech(request.model_copy(update={"prepared_text": spoken}), cancel_generation=gen)
+                return
         language_code = request.language_code
         language_code, _ = resolve_auto_language(language_code)
         lang_name = language_name_for_prompt(language_code, enable=self.enable_lang_prompt)
@@ -1111,6 +1140,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         req_tool_choice = (
             response.tool_choice if response and response.tool_choice else runtime_config.session.tool_choice
         )
+        if mcp_session_key is not None and self.mcp is not None:
+            mcp_tools = self.mcp.tool_definitions() if req_tool_choice != "none" else []
+            if mcp_tools:
+                req_tools = self._merge_mcp_tools(req_tools, mcp_tools)
+                instructions = f"{instructions}\n\n{self.mcp.prompt_note()}".strip()
+            else:
+                mcp_session_key = None
         wants_audio = response_wants_audio(response)
         self._apply_config(active_chat, instructions, wants_audio, language_name=lang_name)
 
@@ -1134,8 +1170,131 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             response_key=request.response_key,
             prefetch_transaction=request.prefetch_transaction,
             history_anchor_id=history_anchor_id,
+            mcp_session_key=mcp_session_key,
         )
         yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+
+    # ── server-side MCP tools ────────────────────────────────────────────────
+
+    @staticmethod
+    def _merge_mcp_tools(req_tools: Any, mcp_tools: list[dict[str, Any]]) -> list[Any]:
+        """Client/session tools first, then MCP tools whose names don't clash."""
+        merged: list[Any] = []
+        names: set[str] = set()
+        for tool in req_tools or []:
+            as_dict = tool if isinstance(tool, dict) else tool.model_dump(exclude_none=True)
+            merged.append(as_dict)
+            if as_dict.get("name"):
+                names.add(as_dict["name"])
+        merged.extend(t for t in mcp_tools if t["name"] not in names)
+        return merged
+
+    @staticmethod
+    def _assistant_item_ids(chat: Chat) -> set[str]:
+        return {
+            item.id
+            for item in list(chat.buffer)
+            if isinstance(item, RealtimeConversationItemAssistantMessage) and item.id is not None
+        }
+
+    @staticmethod
+    def _latest_user_text(chat: Chat) -> str | None:
+        for item in reversed(list(chat.buffer)):
+            if isinstance(item, RealtimeConversationItemUserMessage):
+                parts = [p.text for p in item.content if p.type == "input_text" and p.text]
+                return " ".join(parts) if parts else None
+        return None
+
+    def _mcp_resolve_pending(self, session_key: str, chat: Chat) -> str | None:
+        """Run or drop a parked write tool based on this (the next) user utterance."""
+        assert self.mcp is not None
+        if not self.mcp.has_pending(session_key):
+            return None
+        return self.mcp.resolve_pending(session_key, self._latest_user_text(chat), self._assistant_item_ids(chat))
+
+    def _mcp_tool_loop(
+        self,
+        events: Iterator[ProviderEvent],
+        active_chat: Chat,
+        optional_kwargs: dict[str, Any],
+        turn: _Turn,
+        *,
+        serialize_fn: SerializeFn | None,
+        request_fn: RequestFn | None,
+        event_iterator_fn: EventIteratorFn | None,
+    ) -> Iterator[ProviderEvent]:
+        """Execute MCP tool calls server-side and feed results back to the model.
+
+        Calls to MCP tools are not forwarded to the realtime client (the ESP32
+        and other devices don't run tools). Their results are added to the
+        throwaway ``active_chat`` and the model is asked again; everything else
+        (text, client-side tool calls, usage) passes through unchanged, so the
+        normal streaming/history code downstream sees one continuous response.
+        """
+        assert self.mcp is not None and turn.mcp_session_key is not None
+        runtime = self.mcp
+        # Follow-up rounds must not re-trigger the memory proxy's callback.
+        follow_kwargs = {k: v for k, v in optional_kwargs.items() if k != "extra_headers"}
+        current = events
+        responses: list[Any] = []
+        try:
+            for round_index in range(runtime.config.max_tool_rounds + 1):
+                calls: list[ResponseFunctionToolCall] = []
+                spoken: list[AssistantMessage] = []
+                for event in current:
+                    if isinstance(event, ToolCall) and runtime.owns(event.item.name):
+                        calls.append(event.item)
+                        continue
+                    if isinstance(event, AssistantMessage):
+                        spoken.append(event)
+                    yield event
+                if not calls:
+                    return
+                if self._turn_is_cancelled(turn) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
+                    return
+                if round_index == runtime.config.max_tool_rounds:
+                    logger.warning("MCP tool loop hit max_tool_rounds=%d", runtime.config.max_tool_rounds)
+                    yield TextDelta(text="Sorry, I couldn't finish that request.")
+                    return
+                for message in spoken:
+                    active_chat.add_item(
+                        RealtimeConversationItemAssistantMessage(type="message", role="assistant", content=message.content)
+                    )
+                assistant_ids = self._assistant_item_ids(turn.runtime_config.chat)
+                for call in calls:
+                    output = runtime.execute(
+                        call.name,
+                        call.arguments,
+                        session_key=turn.mcp_session_key,
+                        assistant_ids=assistant_ids,
+                    )
+                    logger.info("MCP %s(%s) -> %s", call.name, transcript_for_log(call.arguments), transcript_for_log(output))
+                    call_id = _generate_id("call")
+                    active_chat.add_item(
+                        RealtimeConversationItemFunctionCall(
+                            type="function_call",
+                            name=call.name,
+                            arguments=call.arguments or "{}",
+                            call_id=call_id,
+                            id=_generate_id("fc"),
+                            status="completed",
+                        )
+                    )
+                    active_chat.add_item(
+                        RealtimeConversationItemFunctionCallOutput(
+                            type="function_call_output",
+                            call_id=call_id,
+                            output=output,
+                            id=_generate_id("fco"),
+                        )
+                    )
+                api_input = (serialize_fn or self._serialize)(active_chat)
+                response = (request_fn or self._request)(api_input, follow_kwargs)
+                responses.append(response)
+                current = (event_iterator_fn or self._iter_events)(response)
+        finally:
+            for response in responses:
+                self._close_response(response)
 
     @property
     def timing_log_level(self) -> int:

@@ -1,0 +1,82 @@
+{
+  "_comment": "Copy to mcp_servers.json and start speech-to-speech with --mcp_config <path>. Secrets come from the environment or a .env next to this file (see .env.example). Only tools listed under 'tools' are exposed to the model. kind=write tools need a spoken 'yes' before they run. Full reference: docs/mcp-tools.md",
+  "defaults": {
+    "call_timeout_s": 8,
+    "startup_wait_s": 20,
+    "max_items": 5,
+    "max_result_chars": 900,
+    "max_tool_rounds": 3,
+    "confirm_ttl_s": 180
+  },
+  "servers": {
+    "google": {
+      "label": "Google",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["workspace-mcp@2.6.0", "--single-user", "--permissions", "gmail:readonly", "calendar:full"],
+      "env": {
+        "GOOGLE_OAUTH_CLIENT_ID": "${GOOGLE_OAUTH_CLIENT_ID}",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "${GOOGLE_OAUTH_CLIENT_SECRET}",
+        "USER_GOOGLE_EMAIL": "${GOOGLE_USER_EMAIL}",
+        "OAUTHLIB_INSECURE_TRANSPORT": "1",
+        "WORKSPACE_MCP_PORT": "8000"
+      },
+      "tools": {
+        "get_events": {
+          "expose_as": "list_calendar_events",
+          "description": "List events on the user's Google Calendar. Omit time_min for 'from now'. Use time_min/time_max (RFC3339) for a specific day or range, and query to search by keyword.",
+          "fixed_args": {"user_google_email": "${GOOGLE_USER_EMAIL}"},
+          "default_args": {"max_results": 5},
+          "expose_params": ["time_min", "time_max", "query"]
+        },
+        "search_gmail_messages": {
+          "expose_as": "search_mail",
+          "description": "Search the user's Gmail using Gmail search syntax, e.g. 'is:unread', 'from:alice newer_than:2d', 'subject:invoice'. Returns sender, subject and date of the newest matches.",
+          "fixed_args": {"user_google_email": "${GOOGLE_USER_EMAIL}", "include_headers": true},
+          "default_args": {"page_size": 5},
+          "expose_params": ["query"]
+        },
+        "manage_event": {
+          "expose_as": "add_calendar_event",
+          "kind": "write",
+          "description": "Add an event to the user's Google Calendar. start_time and end_time are RFC3339 with the local offset; default to one hour long if the user gives no end.",
+          "fixed_args": {"user_google_email": "${GOOGLE_USER_EMAIL}", "action": "create"},
+          "expose_params": ["summary", "start_time", "end_time", "location", "description"],
+          "confirm_template": "add \"{summary}\" to your calendar on {start_time}"
+        }
+      }
+    },
+    "todoist": {
+      "label": "Todoist",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "-p", "@todoist/mcp@17.2.0", "todoist-mcp"],
+      "env": {"TODOIST_API_KEY": "${TODOIST_API_KEY}"},
+      "tools": {
+        "find-tasks-by-date": {
+          "expose_as": "list_tasks",
+          "description": "List the user's Todoist tasks due on a date. Defaults to today including overdue. startDate is YYYY-MM-DD or 'today'; daysCount covers several days.",
+          "default_args": {"limit": 5},
+          "expose_params": ["startDate", "daysCount", "overdueOption"]
+        },
+        "add-tasks": {
+          "expose_as": "add_task",
+          "kind": "write",
+          "description": "Add one task to the user's Todoist inbox.",
+          "wrap_in_list": "tasks",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "content": {"type": "string", "description": "Short task title, e.g. 'Call the dentist'."},
+              "dueString": {"type": "string", "description": "Due date in natural language, e.g. 'tomorrow at 5pm', 'every Monday'."},
+              "priority": {"type": "string", "enum": ["p1", "p2", "p3", "p4"], "description": "p1 is highest. Omit for normal."},
+              "description": {"type": "string", "description": "Optional longer notes."}
+            },
+            "required": ["content"]
+          },
+          "confirm_template": "add the task \"{content}\" {dueString}"
+        }
+      }
+    }
+  }
+}
