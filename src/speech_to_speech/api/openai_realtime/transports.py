@@ -53,6 +53,21 @@ class SessionTransport(ABC):
         track buffer for barge-in to actually silence the assistant.
         """
 
+    def flush_audio(self) -> None:
+        """Release audio held so a slow generator does not play as silence gaps.
+
+        WebSocket sends each chunk as it is generated, so the default is a no-op.
+        """
+        return
+
+    def drop_unreleased_audio(self) -> None:
+        """Drop audio held for a response that will not be played.
+
+        Does not touch audio already handed to the playout clock. WebSocket
+        has nothing held.
+        """
+        return
+
     @abstractmethod
     async def close(self) -> None: ...
 

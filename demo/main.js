@@ -1048,10 +1048,10 @@ function syncConnectionUi() {
     connField.hidden = false;
     inputLbUrl.value = settings.directUrl;
     inputLbUrl.readOnly = false;
-    inputLbUrl.placeholder = "http://localhost:port";
+    inputLbUrl.placeholder = "https://speech.fleming.ai";
     connHint.classList.remove("error");
     connHint.textContent =
-      "URL of your speech-to-speech server, e.g. http://localhost:8080 (the app adds /v1/realtime).";
+      "URL of your speech-to-speech server, e.g. https://speech.fleming.ai (the app adds /v1/realtime).";
   } else {
     // LB mode: the load balancer URL is deployment-owned — hide it entirely so
     // its address is never exposed in Settings.
