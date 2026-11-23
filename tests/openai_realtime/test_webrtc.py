@@ -44,6 +44,7 @@ from speech_to_speech.api.openai_realtime.webrtc_session import (  # noqa: E402
     PcmResampler,
     PipelineAudioTrack,
     WebRTCSession,
+    parse_client_event_message,
     _prioritize_ice_candidates,
     _strip_non_sha256_fingerprints,
 )
@@ -65,6 +66,16 @@ from speech_to_speech.pipeline.messages import (  # noqa: E402
 from .test_openai_client import _ServerEnv  # noqa: E402
 
 PIPELINE_SAMPLE_RATE = 16_000
+
+
+def test_parse_client_event_ignores_one_extra_brace():
+    event = {"type": "session.update", "session": {"voice": "Vivian"}}
+    # The flashed session.update is valid JSON plus one closing brace.
+    assert parse_client_event_message(json.dumps(event) + "}") == event
+
+
+def test_parse_client_event_rejects_garbage():
+    assert parse_client_event_message("not json") is None
 
 
 # ---------------------------------------------------------------------------
@@ -475,65 +486,6 @@ class TestPipelineAudioTrack:
         track.stop()
         with pytest.raises(MediaStreamError):
             await track.recv()
-
-
-class _BeginAudioService:
-    def begin_audio_output(self, *_args, **_kwargs):
-        return ("resp", "item", 0, [])
-
-
-class TestWebRTCPlayoutHold:
-    def _session(self) -> WebRTCSession:
-        async def _noop_async(*_args, **_kwargs):
-            return None
-
-        return WebRTCSession(
-            pc=object(),
-            on_client_event=_noop_async,
-            on_audio=lambda _pcm: None,
-            on_open=_noop_async,
-            on_closed=lambda: None,
-        )
-
-    async def test_chunks_stay_silent_until_flush_then_play_contiguous(self):
-        session = self._session()
-        # 20 ms at the pipeline rate. Two chunks must not reach the track
-        # until flush, and then they must arrive as one buffer.
-        chunk = (np.ones(320, dtype=np.int16) * 1000).tobytes()
-        await session.send_audio_chunk(_BeginAudioService(), "s", chunk, "resp")
-        await session.send_audio_chunk(_BeginAudioService(), "s", chunk, "resp")
-        assert session._track.buffered_bytes == 0
-        assert len(session._held_pcm) > 0
-
-        held = len(session._held_pcm)
-        session.flush_audio()
-        assert len(session._held_pcm) == 0
-        # The resampler keeps a few samples of filter delay, so two 20 ms
-        # chunks land a little under 40 ms. They must still be one buffer,
-        # longer than a single frame.
-        assert session._track.buffered_bytes == held
-        assert session._track.buffered_bytes > WEBRTC_FRAME_SAMPLES * 2
-
-        frame = await session._track.recv()
-        assert np.any(frame.to_ndarray() != 0)
-        session._track.stop()
-
-    def test_discard_drops_held_audio_before_it_plays(self):
-        session = self._session()
-        session._held_pcm.extend(b"\x01\x00" * 100)
-        session.discard_pending_audio()
-        assert len(session._held_pcm) == 0
-        assert session._track.buffered_bytes == 0
-        session._track.stop()
-
-    def test_drop_unreleased_does_not_cut_audio_already_playing(self):
-        session = self._session()
-        session._track.write(b"\x02\x00" * WEBRTC_FRAME_SAMPLES)
-        session._held_pcm.extend(b"\x01\x00" * 50)
-        session.drop_unreleased_audio()
-        assert len(session._held_pcm) == 0
-        assert session._track.buffered_bytes == WEBRTC_FRAME_SAMPLES * 2
-        session._track.stop()
 
 
 # ---------------------------------------------------------------------------

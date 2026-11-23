@@ -39,6 +39,33 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def parse_client_event_message(msg: str) -> dict | None:
+    """Parse one data-channel client event.
+
+    The ESP32 ``session.update`` shipped with one extra closing brace. ``json.loads``
+    rejects that whole message, so voice, instructions, and server VAD never apply.
+    Accept one JSON object and ignore trailing characters.
+    """
+    try:
+        raw = json.loads(msg)
+    except json.JSONDecodeError:
+        try:
+            raw, end = json.JSONDecoder().raw_decode(msg)
+        except json.JSONDecodeError:
+            logger.error("[WebRTC] Invalid JSON on data channel: %s", transcript_for_log(msg))
+            return None
+        trailing = msg[end:].strip()
+        if trailing:
+            logger.warning(
+                "[WebRTC] Ignored %d trailing character(s) after a client event",
+                len(trailing),
+            )
+    if not isinstance(raw, dict):
+        logger.error("[WebRTC] Non-object event on data channel: %s", transcript_for_log(msg))
+        return None
+    return raw
+
 WEBRTC_SAMPLE_RATE = 48_000
 AUDIO_PTIME = 0.02  # 20 ms frames
 WEBRTC_FRAME_SAMPLES = int(WEBRTC_SAMPLE_RATE * AUDIO_PTIME)
@@ -50,12 +77,6 @@ ICE_GATHERING_TIMEOUT_S = 5.0
 # "connected" before we release its pipeline unit. Without this, a client that
 # receives the SDP answer and never completes ICE would hold the unit forever.
 CONNECT_TIMEOUT_S = 30.0
-# Qwen3 on this deployment generates slower than realtime (RTF ~0.2). The
-# playout clock used to pad each gap with silence, so a short greeting arrived
-# as "How can I" [2s] "help". Hold the PCM until the response's audio is done,
-# then hand the track one contiguous buffer. 120s bounds memory if a done
-# sentinel never arrives (48 kHz s16 mono).
-_MAX_HELD_PLAYOUT_BYTES = WEBRTC_SAMPLE_RATE * 2 * 120
 
 #: Allowed networks for ICE host candidates, parsed from SPEECH_TO_SPEECH_ICE_ADDRESSES.
 _address_filter_networks: Optional[list[ipaddress.IPv4Network | ipaddress.IPv6Network]] = None
@@ -546,9 +567,6 @@ class WebRTCSession(SessionTransport):
         self._track = PipelineAudioTrack()
         self._out_resampler = PcmResampler(WEBRTC_SAMPLE_RATE)
         self._in_resampler = PcmResampler(PIPELINE_SAMPLE_RATE)
-        # PCM already resampled to 48 kHz, waiting for the response's audio
-        # to finish so playout does not insert silence between TTS chunks.
-        self._held_pcm = bytearray()
         # Data-channel messages funnel through one queue + consumer task so
         # client events apply in arrival order; dispatching each message in
         # its own task could reorder e.g. session.update vs response.create.
@@ -670,27 +688,9 @@ class WebRTCSession(SessionTransport):
         )
         if events:
             await self.send_events(events)
-        self._held_pcm.extend(self._out_resampler.resample_pcm(pcm, PIPELINE_SAMPLE_RATE))
-        if len(self._held_pcm) >= _MAX_HELD_PLAYOUT_BYTES:
-            logger.warning(
-                "[WebRTC] Held %.1fs of audio without a response end; starting playout early",
-                len(self._held_pcm) / (WEBRTC_SAMPLE_RATE * 2),
-            )
-            self.flush_audio()
-
-    def flush_audio(self) -> None:
-        if not self._held_pcm:
-            return
-        duration_s = len(self._held_pcm) / (WEBRTC_SAMPLE_RATE * 2)
-        logger.info("[WebRTC] Contiguous playout of %.2fs", duration_s)
-        self._track.write(bytes(self._held_pcm))
-        self._held_pcm.clear()
-
-    def drop_unreleased_audio(self) -> None:
-        self._held_pcm.clear()
+        self._track.write(self._out_resampler.resample_pcm(pcm, PIPELINE_SAMPLE_RATE))
 
     def discard_pending_audio(self) -> None:
-        self._held_pcm.clear()
         self._track.clear()
 
     # ── Internals ─────────────────────────────────
@@ -787,13 +787,8 @@ class WebRTCSession(SessionTransport):
     async def _consume_dc_messages(self) -> None:
         while not self._closed:
             msg = await self._dc_messages.get()
-            try:
-                raw = json.loads(msg)
-            except json.JSONDecodeError:
-                logger.error("[WebRTC] Invalid JSON on data channel: %s", transcript_for_log(msg))
-                continue
-            if not isinstance(raw, dict):
-                logger.error("[WebRTC] Non-object event on data channel: %s", transcript_for_log(msg))
+            raw = parse_client_event_message(msg)
+            if raw is None:
                 continue
             try:
                 await self._on_client_event(raw)

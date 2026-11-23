@@ -145,6 +145,7 @@ def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None, rea
     handler.gen_kwargs = {}
     handler.request_timeout_s = 20.0
     handler.request_timeout = 20.0
+    handler.memory_callback_url = None
     handler.disable_thinking = disable_thinking
     handler.reasoning_effort = reasoning_effort
     handler._extra_body = ResponsesApiModelHandler._build_extra_body(
@@ -1008,6 +1009,33 @@ def test_process_read_timeout_speaks_fallback_and_preserves_failure():
     assert isinstance(outputs[1], EndOfResponse)
     assert outputs[1].error is not None and "timed out" in outputs[1].error
     assert [getattr(item, "role", None) for item in request.runtime_config.chat.buffer] == ["user"]
+
+
+def test_read_timeout_with_no_tokens_retries_once():
+    handler = _make_handler()
+    calls = {"n": 0}
+
+    def create(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            stream = MagicMock(spec=Stream)
+            stream.__iter__.side_effect = httpx.ReadTimeout("timed out")
+            return stream
+        return _make_stream(
+            [
+                _make_text_delta_event("How can I help?"),
+                _make_output_item_done_event(content="How can I help?"),
+            ]
+        )
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    outputs = list(handler.process(_make_request("Hi")))
+
+    chunks = [output.text for output in outputs if isinstance(output, LLMResponseChunk)]
+    assert chunks == ["How can I help?"]
+    assert calls["n"] == 2
+    end = next(output for output in outputs if isinstance(output, EndOfResponse))
+    assert end.error is None
 
 
 def test_read_timeout_after_partial_text_fails_without_apology_or_history_commit():

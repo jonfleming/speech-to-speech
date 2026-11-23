@@ -1076,8 +1076,6 @@ def create_app(
                         continue
 
                     if _is_pipeline_end(audio_chunk):
-                        if transport is not None:
-                            transport.flush_audio()
                         if transport is not None and session_id:
                             await _emit_response_events(
                                 transport,
@@ -1112,8 +1110,6 @@ def create_app(
                                     unit.response_playing.clear()
                                 if not (st.in_response or st.response_pending):
                                     unit.should_listen.set()
-                            if transport is not None:
-                                transport.drop_unreleased_audio()
                             unit.cancel_scope.response_done(audio_generation)
                             logger.info(
                                 "Pipeline %d: stale response lifecycle cleaned up",
@@ -1121,8 +1117,6 @@ def create_app(
                             )
                             continue
                         if audio_generation is not None and unit.cancel_scope.is_stale(audio_generation):
-                            if transport is not None:
-                                transport.drop_unreleased_audio()
                             if session_id:
                                 unit.service.close_response_key(session_id, response_key)
                             unit.cancel_scope.response_done(audio_generation)
@@ -1130,12 +1124,8 @@ def create_app(
                             logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
                             continue
                         if session_id is not None and _response_key_is_obsolete(unit, session_id, response_key):
-                            if transport is not None:
-                                transport.drop_unreleased_audio()
                             _discard_obsolete_response_key(unit, session_id, response_key)
                             continue
-                        if transport is not None:
-                            transport.flush_audio()
                         if transport is not None and session_id:
                             await _emit_response_events(
                                 transport,

@@ -785,61 +785,89 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             transaction_rolled_back = True
 
         try:
-            try:
-                api_input = (serialize_fn or self._serialize)(active_chat)
-                # Images the model actually sees this turn; only these are stripped on
-                # write-back, so an image a fast client injects mid-generation for the
-                # next turn survives (it is not in this serialized snapshot).
-                consumed_image_ids = active_chat.image_message_ids()
-                if not api_input:
-                    # Nothing to send: empty `instructions` and no `input` (in the response,
-                    # the default conversation, or the out-of-band context). The provider
-                    # would reject this; fail with a clear message instead of an opaque error.
-                    error_message = "Cannot generate a response: no instructions and no input were provided."
-                else:
-                    provider_request_started = True
+            read_attempts = 0
+            while True:
+                try:
+                    api_input = (serialize_fn or self._serialize)(active_chat)
+                    # Images the model actually sees this turn; only these are stripped on
+                    # write-back, so an image a fast client injects mid-generation for the
+                    # next turn survives (it is not in this serialized snapshot).
+                    consumed_image_ids = active_chat.image_message_ids()
+                    if not api_input:
+                        # Nothing to send: empty `instructions` and no `input` (in the response,
+                        # the default conversation, or the out-of-band context). The provider
+                        # would reject this; fail with a clear message instead of an opaque error.
+                        error_message = "Cannot generate a response: no instructions and no input were provided."
+                    else:
+                        provider_request_started = True
 
-                    def make_request() -> Any:
-                        return (request_fn or self._request)(api_input, optional_kwargs)
+                        def make_request() -> Any:
+                            return (request_fn or self._request)(api_input, optional_kwargs)
 
-                    if turn.prefetch_transaction is not None:
-                        events = self._iter_prefetch_events_interruptibly(
-                            make_request,
-                            event_iterator_fn or self._iter_events,
+                        if turn.prefetch_transaction is not None:
+                            events = self._iter_prefetch_events_interruptibly(
+                                make_request,
+                                event_iterator_fn or self._iter_events,
+                                turn,
+                            )
+                        else:
+                            api_response = make_request()
+                            events = (event_iterator_fn or self._iter_events)(api_response)
+                    if events is not None and turn.mcp_session_key is not None and self.mcp is not None:
+                        events = self._mcp_tool_loop(
+                            events,
+                            active_chat,
+                            optional_kwargs,
                             turn,
+                            serialize_fn=serialize_fn,
+                            request_fn=request_fn,
+                            event_iterator_fn=event_iterator_fn,
                         )
-                    else:
-                        api_response = make_request()
-                        events = (event_iterator_fn or self._iter_events)(api_response)
-                if events is not None and turn.mcp_session_key is not None and self.mcp is not None:
-                    events = self._mcp_tool_loop(
-                        events,
-                        active_chat,
-                        optional_kwargs,
-                        turn,
-                        serialize_fn=serialize_fn,
-                        request_fn=request_fn,
-                        event_iterator_fn=event_iterator_fn,
+                    if events is not None:
+                        if self.stream:
+                            generation_completed = yield from self._consume_streaming(events, state, turn)
+                        else:
+                            generation_completed = yield from self._consume_nonstreaming(events, state, turn)
+                    break
+                except httpx.ReadTimeout:
+                    # brain.fleming.ai sometimes returns HTTP 200 and then sends no
+                    # body. One clean retry recovers the greeting; a timeout after
+                    # tokens, or a second timeout, still ends the response.
+                    read_attempts += 1
+                    close = getattr(api_response, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            logger.debug("Failed to close timed-out language-model response", exc_info=True)
+                    api_response = None
+                    events = None
+                    give_up = (
+                        state.output_emitted
+                        or read_attempts >= 2
+                        or turn.prefetch_transaction is not None
+                        or self._generation_is_stale(turn.gen)
                     )
-                if events is not None:
-                    if self.stream:
-                        generation_completed = yield from self._consume_streaming(events, state, turn)
-                    else:
-                        generation_completed = yield from self._consume_nonstreaming(events, state, turn)
-            except httpx.ReadTimeout:
-                logger.warning(
-                    "OpenAI API read timed out after %.1fs; ending the current response",
-                    self.request_timeout_s,
-                )
-                error_message = f"Language model generation timed out after {self.request_timeout_s:.1f}s."
-            except Exception as exc:
-                # Any other generation failure must still terminate the response: record
-                # the error and fall through to the EndOfResponse below. Without this the
-                # exception would escape process() and no EndOfResponse would be emitted,
-                # leaving st.in_response stuck and locking every subsequent response.
-                log_exception(logger, "LLM generation failed; ending the current response", exc)
-                if error_message is None:
-                    error_message = f"Language model generation failed: {exc}"
+                    if give_up:
+                        logger.warning(
+                            "OpenAI API read timed out after %.1fs; ending the current response",
+                            self.request_timeout_s,
+                        )
+                        error_message = f"Language model generation timed out after {self.request_timeout_s:.1f}s."
+                        break
+                    logger.warning(
+                        "OpenAI API read timed out after %.1fs with no tokens; retrying once",
+                        self.request_timeout_s,
+                    )
+                except Exception as exc:
+                    # Any other generation failure must still terminate the response: record
+                    # the error and fall through to the EndOfResponse below. Without this the
+                    # exception would escape process() and no EndOfResponse would be emitted,
+                    # leaving st.in_response stuck and locking every subsequent response.
+                    log_exception(logger, "LLM generation failed; ending the current response", exc)
+                    if error_message is None:
+                        error_message = f"Language model generation failed: {exc}"
+                    break
 
             if (
                 provider_request_started
